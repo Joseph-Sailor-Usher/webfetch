@@ -1,16 +1,15 @@
 use clap::{ArgGroup, Parser};
-use scraper::Html;
-use webfetch::{client, extract_text, fetch, format_hits, search, truncate_chars, RAW_LIMIT};
+use webfetch::{client, content, fetch, format_hits, label, search, truncate_chars, Format, RAW_LIMIT};
 
 #[derive(Parser)]
 #[command(name = "webfetch", version)]
-#[command(about = "Fetch a URL and print its readable text, or search the web")]
+#[command(about = "Fetch a web page and print its main content as Markdown, or search through SearXNG")]
 #[command(group(ArgGroup::new("target").required(true).args(["url", "search"])))]
 struct Cli {
     /// URL to fetch
     url: Option<String>,
 
-    /// Search query (SearXNG when one answers, else DuckDuckGo's HTML endpoint)
+    /// Search query, answered by a SearXNG instance
     #[arg(short, long)]
     search: Option<String>,
 
@@ -18,17 +17,33 @@ struct Cli {
     #[arg(long, env = "WEBFETCH_SEARXNG", default_value = "http://127.0.0.1:8888")]
     searx: String,
 
-    /// Search DuckDuckGo only, without trying SearXNG
-    #[arg(long)]
-    no_searx: bool,
-
     /// Max lines of output
     #[arg(short, long, default_value = "200")]
     lines: usize,
 
-    /// Raw output: the page's HTML, at most 50,000 bytes (not used with --search)
+    /// Plain text instead of Markdown
+    #[arg(short, long)]
+    text: bool,
+
+    /// The whole page instead of its main content
     #[arg(short, long, conflicts_with = "search")]
+    full: bool,
+
+    /// The page's HTML, at most 50,000 bytes
+    #[arg(short, long, conflicts_with_all = ["search", "text", "full"])]
     raw: bool,
+
+    /// Fetch private, loopback and link-local addresses too (refused by default)
+    #[arg(long)]
+    allow_private: bool,
+
+    /// Leave out the line that marks the output as web content (data, not instructions)
+    #[arg(long)]
+    no_label: bool,
+
+    /// User agent to send (default: webfetch's own name and version)
+    #[arg(long, default_value = webfetch::USER_AGENT)]
+    user_agent: String,
 }
 
 fn main() {
@@ -40,24 +55,46 @@ fn main() {
 }
 
 fn run(cli: &Cli) -> webfetch::Result<()> {
-    let client = client();
-    let text = if let Some(q) = &cli.search {
-        let searx = (!cli.no_searx).then_some(cli.searx.as_str());
-        let hits = search(&client, searx, q)?;
+    let format = if cli.text { Format::Text } else { Format::Markdown };
+    let (source, header, body) = if let Some(q) = &cli.search {
+        let hits = search(&cli.searx, q)?;
         if hits.is_empty() {
             return Err(webfetch::Error(format!("no results for {q:?}")));
         }
-        format_hits(&hits)
+        (format!("a search for {q:?}"), String::new(), format_hits(&hits, format))
     } else {
         let url = cli.url.as_deref().expect("clap requires a URL or --search");
-        let body = fetch(&client, url)?;
+        let guard = !cli.allow_private;
+        let page = fetch(&client(guard, &cli.user_agent), url, guard)?;
         if cli.raw {
-            println!("{}", truncate_chars(&body, RAW_LIMIT));
+            if !cli.no_label {
+                println!("{}", label(&page.url));
+            }
+            println!("{}", truncate_chars(&page.body, RAW_LIMIT));
             return Ok(());
         }
-        extract_text(&Html::parse_document(&body))
+        let c = content(&page.body, &page.url, format, cli.full);
+        let mut header = Vec::new();
+        if !c.title.is_empty() {
+            header.push(if format == Format::Markdown { format!("# {}", c.title) } else { c.title.clone() });
+        }
+        header.push(format!("Source: {}", page.url));
+        if let Some(by) = &c.byline {
+            header.push(format!("By: {by}"));
+        }
+        if !c.article && !cli.full {
+            eprintln!("webfetch: no main content found; printing the whole page");
+        }
+        (page.url.clone(), header.join("\n"), c.body)
     };
-    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    if !cli.no_label {
+        println!("{}", label(&source));
+    }
+    if !header.is_empty() {
+        println!("{header}\n");
+    }
+    // Markdown keeps its blank lines (they carry structure); text drops them
+    let lines: Vec<&str> = body.lines().filter(|l| format == Format::Markdown || !l.trim().is_empty()).collect();
     for line in lines.iter().take(cli.lines) {
         println!("{line}");
     }
