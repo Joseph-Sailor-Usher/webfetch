@@ -58,6 +58,12 @@ covers. All of these are refused whether the URL names them as an IP, as a host 
 that resolves to one (checked in the DNS resolver itself, so a DNS answer cannot slip through), or
 through a redirect. Only `http` and `https` are fetched. `--allow-private` turns the guard off.
 
+The guard also fetches only ports 80 and 443 (written in the URL or the scheme's default), on any host
+and on every redirect. A public web page lives there. Other ports are where admin panels, model servers
+and other services listen, here or out on the internet. `--allow-port 8080` (repeatable) lets another
+port through, for the CLI and for every `--mcp` call. `--allow-private` turns the port check off too,
+because it turns off the whole guard.
+
 The guard ignores the proxy environment: `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` are not used
 while it is on. Through a proxy, webfetch resolves only the proxy's name and never the target's, so the
 target's address would never be checked. A proxy set in an agent's environment or a config file would
@@ -153,7 +159,7 @@ webfetch --mcp --allow-domain docs.rs --allow-url https://example.com/changelog 
 These flags apply only with `--mcp`. The command line is unchanged: a URL a person types is fetched as typed.
 
 Protocol: the `initialize` handshake (2025-03-26 to 2025-11-25) and the stateless 2026-07-28
-revision (`server/discover`) are both answered. `--searx`, `--allow-private`, `--user-agent`,
+revision (`server/discover`) are both answered. `--searx`, `--allow-private`, `--allow-port`, `--user-agent`,
 `--allow-url`, `--allow-domain` and `--max-fetches` apply to every call.
 
 Set it up (with the binary at `~/.local/bin/webfetch`):
@@ -174,9 +180,9 @@ Wikimedia and others ask of scripts. `--user-agent` sends another, for a site th
 ## Exit status
 
 - `0`: the page or the results were printed
-- `1`: the fetch failed (network error, an HTTP status outside 2xx, a refused private address, a body
-  whose Content-Length is over `--max-bytes`, a redirect to another host, a search with no results); the
-  reason is on stderr
+- `1`: the fetch failed (network error, an HTTP status outside 2xx, a refused private address or port, a
+  body whose Content-Length is over `--max-bytes`, a redirect to another host, a search with no results);
+  the reason is on stderr
 - `2`: the command line was wrong (for example neither a URL nor `--search`)
 
 ## Limits

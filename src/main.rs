@@ -14,7 +14,7 @@ struct Cli {
     search: Option<String>,
 
     /// Run as an MCP server on stdio (tools: fetch_page, search); --searx, --allow-private,
-    /// --user-agent, --allow-url, --allow-domain and --max-fetches apply to every call
+    /// --allow-port, --user-agent, --allow-url, --allow-domain and --max-fetches apply to every call
     #[arg(long, conflicts_with_all = ["text", "full", "raw", "no_label", "lines", "max_bytes"])]
     mcp: bool,
 
@@ -41,6 +41,10 @@ struct Cli {
     /// Fetch private, loopback and link-local addresses too (refused by default)
     #[arg(long)]
     allow_private: bool,
+
+    /// Fetch this port too, besides 80 and 443 (repeatable; others are refused while the guard is on)
+    #[arg(long = "allow-port", value_name = "PORT")]
+    allow_port: Vec<u16>,
 
     /// Leave out the line that marks the output as web content (data, not instructions)
     #[arg(long)]
@@ -69,6 +73,7 @@ struct Cli {
 
 fn main() {
     let cli = Cli::parse();
+    webfetch::allow_ports(cli.allow_port.iter().copied());
     if !cli.mcp && (!cli.allow_url.is_empty() || !cli.allow_domain.is_empty() || cli.max_fetches.is_some()) {
         eprintln!("webfetch: --allow-url, --allow-domain and --max-fetches apply only with --mcp \
 (a URL you type is fetched as you typed it)");

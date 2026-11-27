@@ -44,7 +44,7 @@ fn the_guard_refuses_private_literals_and_other_schemes() {
 
 #[test]
 fn the_guarded_client_refuses_a_name_that_resolves_inside() {
-    let err = fetch(&client(true, USER_AGENT), "http://localhost:9/", true).unwrap_err();
+    let err = fetch(&client(true, USER_AGENT), "http://localhost/", true).unwrap_err();
     assert!(err.0.contains("private address"), "{err}");
     let err = fetch(&client(true, USER_AGENT), "http://127.0.0.1:9/", true).unwrap_err();
     assert!(err.0.contains("private address"), "{err}");
@@ -62,7 +62,8 @@ fn refuses_this_machines_own_address() {
     let guard = Guard::with_local([own6, own4])
         .with_host("own.test", [own6])
         .with_host("own4.test", [own4])
-        .with_host("public.test", [public]);
+        .with_host("public.test", [public])
+        .allow_port(11434); // so the address, not the port, is what refuses
     assert!(guard.refuses(own6) && guard.refuses(own4) && guard.refuses("::ffff:203.0.113.7".parse().unwrap()));
     assert!(!guard.refuses(public));
 
@@ -112,6 +113,56 @@ fn refuses_this_machines_own_address() {
     assert_eq!(parse_if_inet6(v6), vec![own6, "::1".parse::<IpAddr>().unwrap()]);
     let trie = "Main:\n  +-- 0.0.0.0/0 3 0 5\n     |-- 203.0.113.0\n        /24 link UNICAST\n     |-- 203.0.113.7\n        /32 host LOCAL\n";
     assert_eq!(parse_fib_trie(trie), vec![own4]);
+}
+
+#[test]
+fn refuses_ports_other_than_80_and_443() {
+    use std::io::{Read, Write};
+    let public: IpAddr = "2606:4700:4700::1111".parse().unwrap();
+    let guard = Guard::with_local([]).with_host("public.test", [public]);
+    let url = |u: &str| reqwest::Url::parse(u).unwrap();
+
+    // on a public host, by name and by literal IP
+    for u in ["http://public.test:8765/v1", "http://public.test:11434/api/tags", "https://public.test:8765/",
+              "http://[2606:4700:4700::1111]:11434/api/tags", "http://93.184.216.34:8765/"] {
+        let err = guard.check_url(&url(u)).unwrap_err();
+        assert!(err.0.contains("is not a web port") && err.0.contains("--allow-port"), "{u}: {err}");
+        let err = fetch_with(&client_with(Some(Arc::new(guard.clone())), USER_AGENT), u, Some(&guard)).unwrap_err();
+        assert!(err.0.contains("is not a web port"), "{u}: {err}");
+    }
+    // 80 and 443, written or the scheme's default, pass
+    for u in ["http://public.test/", "https://public.test/", "http://public.test:80/", "https://public.test:443/",
+              "http://93.184.216.34:443/"] {
+        assert!(guard.check_url(&url(u)).is_ok(), "{u}");
+    }
+    // --allow-port 8080 lets :8080 through, and nothing else
+    let allowed = guard.clone().allow_port(8080);
+    assert!(guard.check_url(&url("http://public.test:8080/")).is_err());
+    assert!(allowed.check_url(&url("http://public.test:8080/")).is_ok());
+    assert!(allowed.check_url(&url("https://93.184.216.34:8080/")).is_ok());
+    assert!(allowed.check_url(&url("http://public.test:8765/")).is_err());
+    // the port check never lets a refused address through
+    assert!(allowed.check_url(&url("http://127.0.0.1:8080/")).unwrap_err().0.contains("private address"));
+
+    // on a redirect: a server (reached unchecked, straight through the client) sends the fetch to a
+    // public host's :8765, then its :11434; the guarded client's redirect policy refuses both
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for (i, stream) in listener.incoming().take(2).enumerate() {
+            let mut s = stream.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = s.read(&mut buf);
+            let to = ["http://public.test:8765/v1", "http://93.184.216.34:11434/api/tags"][i];
+            let reply = format!("HTTP/1.1 302 Found\r\nLocation: {to}\r\nContent-Length: 0\r\n\r\n");
+            s.write_all(reply.as_bytes()).unwrap();
+        }
+    });
+    let c = client_with(Some(Arc::new(guard.clone())), USER_AGENT);
+    for p in [8765, 11434] {
+        let err = fetch_with(&c, &format!("http://127.0.0.1:{port}/"), None).unwrap_err();
+        assert!(err.0.contains(&format!("port {p} is not a web port")), "{err}");
+    }
 }
 
 #[test]

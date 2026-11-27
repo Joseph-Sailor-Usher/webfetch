@@ -7,6 +7,7 @@
 //! - Redirects are followed on the same host only (http to https included, up to 5 hops); a redirect to
 //!   another host stops the fetch and is handed back, so an open redirect on a trusted site leads nowhere
 //!   unasked.
+//! - They reach ports 80 and 443 only, unless the operator allows another (`--allow-port`).
 //! - Output can carry a label saying it is web content: data, not instructions.
 
 pub mod mcp;
@@ -83,17 +84,45 @@ fn literal_ip(url: &reqwest::Url) -> Option<IpAddr> {
 pub struct Guard {
     local: HashSet<IpAddr>,
     hosts: HashMap<String, Vec<IpAddr>>,
+    ports: HashSet<u16>,
+}
+
+/// The ports a guarded fetch may reach without the operator's say: a public web page lives on these.
+pub const WEB_PORTS: [u16; 2] = [80, 443];
+
+/// The ports the operator allowed besides [`WEB_PORTS`] (`--allow-port`), set once at startup and read
+/// by [`Guard::from_interfaces`], so the CLI and the MCP server's guards both honour them.
+static ALLOWED_PORTS: std::sync::OnceLock<Vec<u16>> = std::sync::OnceLock::new();
+
+/// Allow `ports` besides 80 and 443 for every guard [`Guard::from_interfaces`] builds from now on. Call it
+/// once, before the first fetch; a second call is ignored.
+pub fn allow_ports(ports: impl IntoIterator<Item = u16>) {
+    let _ = ALLOWED_PORTS.set(ports.into_iter().collect());
 }
 
 impl Guard {
     /// The guard for this machine: its interfaces' addresses, read now.
+    /// It also lets through the ports [`allow_ports`] named.
     pub fn from_interfaces() -> Guard {
-        Guard::with_local(local_addrs())
+        let mut g = Guard::with_local(local_addrs());
+        g.ports.extend(ALLOWED_PORTS.get().into_iter().flatten());
+        g
     }
 
     /// A guard that takes `addrs` for this machine's own addresses (tests inject them here).
     pub fn with_local(addrs: impl IntoIterator<Item = IpAddr>) -> Guard {
-        Guard { local: addrs.into_iter().map(canonical).collect(), hosts: HashMap::new() }
+        Guard { local: addrs.into_iter().map(canonical).collect(), hosts: HashMap::new(), ports: HashSet::new() }
+    }
+
+    /// Let `port` through besides 80 and 443 (`--allow-port`).
+    pub fn allow_port(mut self, port: u16) -> Guard {
+        self.ports.insert(port);
+        self
+    }
+
+    /// Whether a fetch may reach `port`: 80, 443, or one the operator allowed.
+    pub fn allows_port(&self, port: u16) -> bool {
+        WEB_PORTS.contains(&port) || self.ports.contains(&port)
     }
 
     /// Answer `host` with `addrs` instead of asking DNS (for tests: a name that resolves to a given address).
@@ -114,8 +143,10 @@ impl Guard {
         is_private(ip) || self.is_local(ip)
     }
 
-    /// Refuse a URL that is not http(s) or whose host is a refused literal IP (names are checked by
-    /// [`Guard::lookup`], in the guarding client's resolver).
+    /// Refuse a URL that is not http(s), whose host is a refused literal IP (names are checked by
+    /// [`Guard::lookup`], in the guarding client's resolver), or whose port (the scheme's default
+    /// included) is not 80 or 443 and not one the operator allowed: other ports are where admin panels
+    /// and model servers live, not public web pages.
     pub fn check_url(&self, url: &reqwest::Url) -> Result<()> {
         if !matches!(url.scheme(), "http" | "https") {
             return Err(Error(format!("refusing {url}: only http and https are fetched")));
@@ -127,6 +158,13 @@ impl Guard {
             if self.is_local(ip) {
                 return Err(Error(format!(
                     "refusing {url}: {ip} is this machine's own address, a private address (--allow-private to fetch it)"
+                )));
+            }
+        }
+        if let Some(port) = url.port_or_known_default() {
+            if !self.allows_port(port) {
+                return Err(Error(format!(
+                    "refusing {url}: port {port} is not a web port (80 or 443); --allow-port {port} to fetch it"
                 )));
             }
         }
