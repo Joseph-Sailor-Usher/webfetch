@@ -1,5 +1,5 @@
 use clap::{ArgGroup, Parser};
-use webfetch::{client, content, fetch_capped, format_hits, label, search, truncate_chars, Format, RAW_LIMIT};
+use webfetch::{client_for, content, fetch_capped, format_hits, label, search, truncate_chars, Format, RAW_LIMIT};
 
 #[derive(Parser)]
 #[command(name = "webfetch", version)]
@@ -14,8 +14,8 @@ struct Cli {
     search: Option<String>,
 
     /// Run as an MCP server on stdio (tools: fetch_page, search); --searx, --allow-private,
-    /// --allow-port, --user-agent, --allow-url, --allow-domain and --max-fetches apply to every call
-    #[arg(long, conflicts_with_all = ["text", "full", "raw", "no_label", "lines", "max_bytes"])]
+    /// --allow-port, --proxy, --user-agent, --allow-url, --allow-domain and --max-fetches apply to every call
+    #[arg(long, conflicts_with_all = ["text", "full", "raw", "no_label", "lines", "max_bytes", "follow_redirects"])]
     mcp: bool,
 
     /// SearXNG base URL for --search
@@ -45,6 +45,17 @@ struct Cli {
     /// Fetch this port too, besides 80 and 443 (repeatable; others are refused while the guard is on)
     #[arg(long = "allow-port", value_name = "PORT")]
     allow_port: Vec<u16>,
+
+    /// Fetch through this proxy (an http:// or https:// URL). The environment's HTTP(S)_PROXY is
+    /// ignored while the guard is on; through --proxy the proxy resolves host names, so it must refuse
+    /// private addresses itself (a private literal IP is still refused here)
+    #[arg(long, value_name = "URL")]
+    proxy: Option<String>,
+
+    /// Follow a redirect to another host instead of stopping and naming it (the guard still checks
+    /// every hop)
+    #[arg(long, conflicts_with = "search")]
+    follow_redirects: bool,
 
     /// Leave out the line that marks the output as web content (data, not instructions)
     #[arg(long)]
@@ -79,6 +90,12 @@ fn main() {
 (a URL you type is fetched as you typed it)");
         std::process::exit(2);
     }
+    if let Some(p) = &cli.proxy {
+        if let Err(e) = webfetch::proxy(p) {
+            eprintln!("webfetch: --proxy: {e}");
+            std::process::exit(2);
+        }
+    }
     if cli.mcp {
         if let Some(bad) = cli.allow_url.iter().find(|u| webfetch::mcp::normalize_url(u).is_none()) {
             eprintln!("webfetch: --allow-url {bad:?} is not a URL");
@@ -91,6 +108,7 @@ fn main() {
             allow_urls: cli.allow_url.clone(),
             allow_domains: cli.allow_domain.clone(),
             max_fetches: cli.max_fetches.unwrap_or(50),
+            proxy: cli.proxy.clone(),
             session: Default::default(),
         });
         return;
@@ -113,7 +131,8 @@ fn run(cli: &Cli) -> webfetch::Result<()> {
         let url = cli.url.as_deref().expect("clap requires a URL or --search");
         let guard = !cli.allow_private;
         let checker = guard.then(webfetch::Guard::from_interfaces);
-        let page = fetch_capped(&client(guard, &cli.user_agent), url, checker.as_ref(), cli.max_bytes)?;
+        let c = client_for(guard, &cli.user_agent, cli.proxy.as_deref(), cli.follow_redirects)?;
+        let page = fetch_capped(&c, url, checker.as_ref(), cli.max_bytes)?;
         let cut = page.truncation_notice();
         if let Some(n) = &cut {
             eprintln!("webfetch: {n}");

@@ -155,3 +155,43 @@ fn a_search_with_no_results_exits_1() {
     assert_eq!(o.status.code(), Some(1));
     assert!(stderr(&o).contains("no results"), "{}", stderr(&o));
 }
+
+/// A status line's content type with extra headers after it (serve() writes it as given).
+fn with_location(to: String) -> &'static str {
+    Box::leak(format!("text/plain\r\nLocation: {to}").into_boxed_str())
+}
+
+#[test]
+fn follow_redirects_follows_another_host_and_without_it_the_fetch_stops() {
+    let other = serve(vec![("/landing", "200 OK", "text/html", "<html><body><p>landed here</p></body></html>".into())]);
+    let first = serve(vec![("/hop", "302 Found", with_location(format!("{other}/landing")), String::new())]);
+    let hop = format!("{first}/hop");
+    let o = webfetch(&[&hop, "--allow-private"]);
+    assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+    assert!(stderr(&o).contains("another host") && stderr(&o).contains(&other), "{}", stderr(&o));
+    let o = webfetch(&[&hop, "--allow-private", "--follow-redirects"]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert!(stdout(&o).contains("landed here"), "{}", stdout(&o));
+}
+
+#[test]
+fn proxy_carries_a_guarded_fetch_and_a_bad_proxy_is_a_usage_error() {
+    // a proxy sees the absolute URL on the request line; the guard stays on (no --allow-private)
+    let proxy = serve(vec![("http://example.test/", "200 OK", "text/html",
+                            "<html><body><p>through the proxy</p></body></html>".into())]);
+    let o = webfetch(&["http://example.test/", "--proxy", &proxy]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert!(stdout(&o).contains("through the proxy"), "{}", stdout(&o));
+    // a private literal IP is still refused before anything is sent
+    let o = webfetch(&["http://10.0.0.7/", "--proxy", &proxy]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(stderr(&o).contains("private address"), "{}", stderr(&o));
+    let o = webfetch(&["http://example.test/", "--proxy", "not a url"]);
+    assert_eq!(o.status.code(), Some(2), "{}", stderr(&o));
+}
+
+#[test]
+fn follow_redirects_is_not_for_mcp() {
+    let o = webfetch(&["--mcp", "--follow-redirects"]);
+    assert_eq!(o.status.code(), Some(2), "{}", stderr(&o));
+}

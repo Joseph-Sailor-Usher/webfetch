@@ -405,6 +405,7 @@ fn does_not_follow_a_redirect_to_another_host() {
         allow_urls: vec![format!("{base}/away")],
         allow_domains: vec![],
         max_fetches: 50,
+        proxy: None,
         session: Default::default(),
     };
     let call = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
@@ -541,4 +542,59 @@ predict both, {bidi_on}reversed{bidi_off} and {red}red{reset}, years ahead for e
     // C0 and C1 controls go; newline and tab stay; an OSC sequence goes whole
     let (s, n) = strip_invisible("a\u{7}b\u{0}c\td\ne\u{85}f\u{1b}]0;title\u{7}g\u{9b}2Jh\r");
     assert_eq!((s.as_str(), n), ("abc\td\nefgh", 1 + 1 + 1 + 10 + 3 + 1));
+}
+
+/// Card-2's gate and card-4's redirect hand-back together: the redirect_url fetch_page returns may be
+/// fetched with the next call (the site named it, not the agent), while a URL nobody returned is still
+/// refused.
+#[test]
+fn mcp_redirect_target_may_be_fetched_next() {
+    use std::io::{Read, Write};
+    fn serve_one(reply: String) -> String {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", l.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for stream in l.incoming() {
+                let Ok(mut s) = stream else { continue };
+                let mut buf = [0u8; 2048];
+                let _ = s.read(&mut buf);
+                let _ = s.write_all(reply.as_bytes());
+            }
+        });
+        base
+    }
+    let body = "<html><body><main><p>landed on the other host</p></main></body></html>";
+    let other = serve_one(format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    ));
+    let landing = format!("{other}/landing");
+    let first = serve_one(format!(
+        "HTTP/1.1 302 Found\r\nLocation: {landing}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    ));
+    let s = mcp::Settings {
+        searx: String::new(),
+        allow_private: true,
+        user_agent: USER_AGENT.into(),
+        allow_urls: vec![format!("{first}/hop")],
+        allow_domains: vec![],
+        max_fetches: 50,
+        proxy: None,
+        session: Default::default(),
+    };
+    let fetch_page = |url: &str| {
+        let call = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                      "params": {"name": "fetch_page", "arguments": {"url": url}}});
+        mcp::handle(&call, &s).unwrap()["result"].clone()
+    };
+    // a URL nobody returned is refused before and after
+    assert!(fetch_page(&format!("{other}/elsewhere"))["content"][0]["text"].as_str().unwrap().contains("refused"));
+    // the allowed URL redirects to another host: handed back, not followed
+    let r = fetch_page(&format!("{first}/hop"));
+    assert_eq!((r["isError"].as_bool(), r["structuredContent"]["redirect_url"].as_str()), (Some(true), Some(landing.as_str())), "{r}");
+    // and the call it invites is not refused
+    let r = fetch_page(&landing);
+    assert_eq!(r["isError"], false, "{r}");
+    assert!(r["structuredContent"]["content"].as_str().unwrap().contains("landed on the other host"), "{r}");
+    assert!(fetch_page(&format!("{other}/elsewhere"))["content"][0]["text"].as_str().unwrap().contains("refused"));
 }

@@ -295,8 +295,20 @@ pub fn proxy(url: &str) -> Result<reqwest::Proxy> {
 /// address check moves to the proxy: the guard still refuses a private or local literal IP in the URL and
 /// on redirects, but a name is resolved by the proxy, not checked here.
 pub fn client_via(guard: bool, user_agent: &str, proxy_url: Option<&str>) -> Result<reqwest::blocking::Client> {
+    client_for(guard, user_agent, proxy_url, false)
+}
+
+/// The client the command line asks for: guarded unless `--allow-private`, through `--proxy <url>` when
+/// given, and following redirects to any host only with `--follow-redirects` (the guard still checks
+/// every hop). An unparseable proxy URL is an error.
+pub fn client_for(
+    guard: bool,
+    user_agent: &str,
+    proxy_url: Option<&str>,
+    follow_any_host: bool,
+) -> Result<reqwest::blocking::Client> {
     let p = proxy_url.map(proxy).transpose()?;
-    Ok(client_proxied(guard.then(|| Arc::new(Guard::from_interfaces())), user_agent, p))
+    Ok(build_client(guard.then(|| Arc::new(Guard::from_interfaces())), user_agent, p, follow_any_host))
 }
 
 /// [`client_with`] through `proxy` when there is one. A guarded client never takes a proxy from the

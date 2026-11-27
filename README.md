@@ -70,8 +70,8 @@ target's address would never be checked. A proxy set in an agent's environment o
 then turn the guard off without anyone choosing `--allow-private`. If you really need a proxy, name it
 yourself with `--proxy <url>` (the library's `client_via`). The address check then moves to the proxy:
 webfetch still refuses a private or local literal IP in the URL and on redirects, but the proxy
-resolves and reaches host names, so the proxy has to refuse private addresses itself. (The library
-side is in place; the CLI and MCP flag still has to be wired in `src/main.rs`.)
+resolves and reaches host names, so the proxy has to refuse private addresses itself. `--proxy` works
+for the CLI and for every `--mcp` call; a URL that is not a proxy URL is a usage error (exit 2).
 
 ## Redirects to another host are not followed
 
@@ -84,10 +84,12 @@ count as another host) stops the fetch, and the new URL is handed back instead o
   stderr and exits with status 1, so you can fetch the new URL yourself if you trust it;
 - `fetch_page` returns an `isError` result whose `structuredContent` carries `redirect_url` (with `url`,
   the URL that redirected, and `status`), and whose text names it too, so the agent makes a new,
-  deliberate call.
+  deliberate call. That URL is then allowed for the session: the site named it, not the agent, so the
+  URL gate (below) lets the next call through, and the address and port guards still check it.
 
-The library's `client_following` follows redirects to any host, as webfetch used to (the private-address
-guard still checks every hop); a `--follow-redirects` flag for the CLI is still to be wired in `main.rs`.
+`--follow-redirects` (CLI only) follows a redirect to another host, as webfetch used to; the
+private-address and port guards still check every hop. The library's `client_following` and
+`client_for` do the same.
 
 ## Search
 
