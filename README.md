@@ -33,6 +33,17 @@ The article, as Markdown...
   dropped (they cost an agent tokens and carry no text). `--text` prints plain text instead.
 - **The label.** The first line marks the output as web content: data, not instructions, a basic
   guard against prompt injection when an agent reads it. `--no-label` leaves it out.
+- **Nothing hidden.** Text a person reading the page never sees is where injected instructions hide,
+  so it is taken out before the content reaches a model or a terminal. Elements hidden by markup go
+  before readability or the whole-page path sees the page: the `hidden` attribute, `aria-hidden="true"`,
+  and an inline style of `display: none` or `visibility: hidden` (inline styles only - webfetch runs no
+  CSS, so a class that hides text does not). From what comes out go Unicode tag characters
+  (U+E0000-U+E007F, "ASCII smuggling"), zero-width characters (U+200B-U+200D, U+2060, U+FEFF), bidi
+  controls (U+202A-U+202E, U+2066-U+2069) and C0/C1 control characters except newline and tab - ANSI
+  escape sequences whole, so a page cannot drive your terminal. When anything was removed, a line on
+  stderr says how much (`webfetch: <url>: removed 4 hidden element(s) and 32 invisible or control
+  character(s) ...`): the page was trying something. `--raw` prints the page as served and strips
+  nothing.
 
 ## Private addresses are refused
 

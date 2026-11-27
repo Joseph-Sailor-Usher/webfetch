@@ -512,27 +512,82 @@ pub struct Content {
     pub body: String,
     /// true when readability found the main content; false when this is the whole page
     pub article: bool,
+    /// what was taken out because a person reading the page would never see it
+    pub removed: Removed,
+}
+
+/// What [`content`] took out of a page: elements hidden by markup, and invisible or control
+/// characters. A page with any of these may be hiding instructions from the person who reads it.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Removed {
+    /// elements with `hidden`, `aria-hidden="true"`, or inline `display:none` / `visibility:hidden`
+    pub hidden_elements: usize,
+    /// Unicode tag characters, zero-width characters, bidi controls and C0/C1 controls (ANSI
+    /// escape sequences whole), counted in characters
+    pub invisible_chars: usize,
+}
+
+impl Removed {
+    pub fn any(&self) -> bool {
+        self.hidden_elements > 0 || self.invisible_chars > 0
+    }
+
+    /// One line for stderr or an agent's notice, when anything was removed.
+    pub fn notice(&self) -> Option<String> {
+        self.any().then(|| {
+            format!(
+                "removed {} hidden element(s) and {} invisible or control character(s) a reader of the page would not see - the page may be hiding instructions",
+                self.hidden_elements, self.invisible_chars
+            )
+        })
+    }
 }
 
 /// The main content of `html` (fetched from `url`), as Markdown or text. With `full`, or when
 /// readability finds no article, the whole page's body (minus scripts, styles, navigation and forms).
+///
+/// Elements hidden by markup are dropped before either path sees the page, and invisible and control
+/// characters are stripped from what comes out (see [`Removed`]); when anything was removed a line
+/// says so on stderr.
 pub fn content(html: &str, url: &str, format: Format, full: bool) -> Content {
-    let doc = Html::parse_document(html);
+    let c = content_inner(html, url, format, full);
+    if let Some(n) = c.removed.notice() {
+        eprintln!("webfetch: {url}: {n}");
+    }
+    c
+}
+
+fn content_inner(html: &str, url: &str, format: Format, full: bool) -> Content {
+    let mut removed = Removed::default();
+    let (html, n) = strip_invisible(html);
+    removed.invisible_chars += n;
+    let mut doc = Html::parse_document(&html);
+    removed.hidden_elements = drop_hidden(&mut doc);
+    let html = if removed.hidden_elements > 0 { doc.html() } else { html };
+    fn clean(s: String, count: &mut usize) -> String {
+        let (s, n) = strip_invisible(&s);
+        *count += n;
+        s
+    }
     let title = page_title(&doc);
     if !full {
         let cfg = dom_smoothie::Config {
             text_mode: if format == Format::Text { dom_smoothie::TextMode::Formatted } else { dom_smoothie::TextMode::Raw },
             ..Default::default()
         };
-        let article = dom_smoothie::Readability::new(html, Some(url), Some(cfg)).and_then(|mut r| r.parse());
+        let article = dom_smoothie::Readability::new(html.as_str(), Some(url), Some(cfg)).and_then(|mut r| r.parse());
         if let Ok(a) = article {
             let body = match format {
                 Format::Text => tidy(&a.text_content),
                 Format::Markdown => to_markdown(&a.content),
             };
+            let mut n = 0;
+            let body = clean(body, &mut n);
             if !body.trim().is_empty() {
-                let title = if a.title.trim().is_empty() { title } else { a.title.trim().to_string() };
-                return Content { title, byline: a.byline.filter(|b| !b.trim().is_empty()), body, article: true };
+                let title = clean(if a.title.trim().is_empty() { title } else { a.title.trim().to_string() }, &mut n);
+                let byline = a.byline.map(|b| clean(b, &mut n)).filter(|b| !b.trim().is_empty());
+                removed.invisible_chars += n;
+                return Content { title, byline, body, article: true, removed };
             }
         }
     }
@@ -540,7 +595,118 @@ pub fn content(html: &str, url: &str, format: Format, full: bool) -> Content {
         Format::Text => extract_text(&doc),
         Format::Markdown => to_markdown(&body_html(&doc)),
     };
-    Content { title, byline: None, body, article: false }
+    let body = clean(body, &mut removed.invisible_chars);
+    let title = clean(title, &mut removed.invisible_chars);
+    Content { title, byline: None, body, article: false, removed }
+}
+
+/// Detach every element hidden by markup - the `hidden` attribute, `aria-hidden="true"`, or an inline
+/// style with `display: none` or `visibility: hidden` (inline styles only: no CSS is run) - and return
+/// how many were taken out (an element inside one already taken counts once, with its ancestor).
+fn drop_hidden(doc: &mut Html) -> usize {
+    let mut hidden = Vec::new();
+    let mut stack = vec![doc.tree.root().id()];
+    while let Some(id) = stack.pop() {
+        let node = doc.tree.get(id).unwrap();
+        if let Node::Element(e) = node.value() {
+            if is_hidden(e) {
+                hidden.push(id);
+                continue; // its children go with it
+            }
+        }
+        stack.extend(node.children().map(|c| c.id()));
+    }
+    for id in &hidden {
+        if let Some(mut n) = doc.tree.get_mut(*id) {
+            n.detach();
+        }
+    }
+    hidden.len()
+}
+
+fn is_hidden(e: &scraper::node::Element) -> bool {
+    if e.attr("hidden").is_some() {
+        return true;
+    }
+    if e.attr("aria-hidden").is_some_and(|v| v.trim().eq_ignore_ascii_case("true")) {
+        return true;
+    }
+    e.attr("style").is_some_and(|style| {
+        style.split(';').any(|decl| {
+            let Some((name, value)) = decl.split_once(':') else { return false };
+            let name = name.trim().to_ascii_lowercase();
+            let value: String = value.to_ascii_lowercase().replace("!important", "").split_whitespace().collect();
+            (name == "display" && value == "none") || (name == "visibility" && value == "hidden")
+        })
+    })
+}
+
+/// Whether `c` is a character [`strip_invisible`] removes: Unicode tag characters (U+E0000-U+E007F,
+/// "ASCII smuggling"), zero-width characters (U+200B-U+200D, U+2060, U+FEFF), bidi controls
+/// (U+202A-U+202E, U+2066-U+2069), and C0/C1 control characters and DEL, except newline and tab.
+pub fn is_invisible(c: char) -> bool {
+    matches!(c,
+        '\u{E0000}'..='\u{E007F}'
+        | '\u{200B}'..='\u{200D}' | '\u{2060}' | '\u{FEFF}'
+        | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+        | '\u{7F}'..='\u{9F}')
+        || (c.is_ascii_control() && c != '\n' && c != '\t')
+}
+
+/// `s` without invisible and control characters (see [`is_invisible`]), and how many characters
+/// were removed. An ANSI escape sequence goes whole - ESC with its CSI (`ESC [ ... final`), OSC
+/// (`ESC ] ... BEL` or `ESC ] ... ESC \`) or two-character form, and a C1 CSI (U+009B) with its
+/// parameters - so no `[31m` is left behind and nothing reaches a terminal to drive it.
+pub fn strip_invisible(s: &str) -> (String, usize) {
+    if !s.chars().any(is_invisible) {
+        return (s.to_string(), 0);
+    }
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut removed = 0;
+    let mut i = 0;
+    // the end (exclusive) of a CSI's parameters and final byte, starting at `j`
+    let csi_end = |mut j: usize| {
+        while j < chars.len() && ('\u{20}'..='\u{3F}').contains(&chars[j]) {
+            j += 1;
+        }
+        if j < chars.len() && ('\u{40}'..='\u{7E}').contains(&chars[j]) {
+            j += 1;
+        }
+        j
+    };
+    while i < chars.len() {
+        let c = chars[i];
+        let end = match c {
+            '\u{1B}' => match chars.get(i + 1) {
+                Some('[') => csi_end(i + 2),
+                Some(']') => {
+                    let mut j = i + 2;
+                    loop {
+                        match chars.get(j) {
+                            None => break j,
+                            Some('\u{07}') => break j + 1,
+                            Some('\u{1B}') if chars.get(j + 1) == Some(&'\\') => break j + 2,
+                            Some('\n') => break j, // an unterminated OSC does not eat the page
+                            _ => j += 1,
+                        }
+                    }
+                }
+                Some(n) if ('\u{40}'..='\u{5F}').contains(n) => i + 2,
+                _ => i + 1,
+            },
+            '\u{9B}' => csi_end(i + 1),
+            c if is_invisible(c) => i + 1,
+            _ => {
+                out.push(c);
+                i += 1;
+                continue;
+            }
+        };
+        removed += end - i;
+        i = end;
+    }
+    (out, removed)
 }
 
 fn page_title(doc: &Html) -> String {
