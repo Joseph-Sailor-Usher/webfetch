@@ -4,6 +4,9 @@
 //!   Markdown with htmd (a port of turndown.js); links come out absolute.
 //! - Page fetches refuse private, loopback, link-local and metadata addresses, and this machine's own
 //!   addresses (by name, by literal IP and on every redirect), so a page cannot steer an agent into this machine's or this network's services.
+//! - Redirects are followed on the same host only (http to https included, up to 5 hops); a redirect to
+//!   another host stops the fetch and is handed back, so an open redirect on a trusted site leads nowhere
+//!   unasked.
 //! - Output can carry a label saying it is web content: data, not instructions.
 
 pub mod mcp;
@@ -242,7 +245,7 @@ pub fn client(guard: bool, user_agent: &str) -> reqwest::blocking::Client {
 /// would only ever see the proxy's name, never the target's, and the guard would be off without anyone
 /// choosing `--allow-private`.
 pub fn client_with(guard: Option<Arc<Guard>>, user_agent: &str) -> reqwest::blocking::Client {
-    client_proxied(guard, user_agent, None)
+    build_client(guard, user_agent, None, false)
 }
 
 /// A proxy for every scheme, from the operator's `--proxy <url>`.
@@ -258,13 +261,46 @@ pub fn client_via(guard: bool, user_agent: &str, proxy_url: Option<&str>) -> Res
     Ok(client_proxied(guard.then(|| Arc::new(Guard::from_interfaces())), user_agent, p))
 }
 
-/// The one client builder: guarded by `guard` when there is one, through `proxy` when there is one. A
-/// guarded client never takes a proxy from the environment; an unguarded one (`--allow-private`, or
-/// SearXNG) keeps reqwest's default of using it when no proxy is given.
+/// [`client_with`] through `proxy` when there is one. A guarded client never takes a proxy from the
+/// environment; an unguarded one (`--allow-private`, or SearXNG) keeps reqwest's default of using it when
+/// no proxy is given.
 pub fn client_proxied(
     guard: Option<Arc<Guard>>,
     user_agent: &str,
     proxy: Option<reqwest::Proxy>,
+) -> reqwest::blocking::Client {
+    build_client(guard, user_agent, proxy, false)
+}
+
+/// The HTTP client that follows redirects to any host (the old behaviour; the CLI's `--follow-redirects`).
+/// The guard, when there is one, still checks every hop.
+pub fn client_following(guard: bool, user_agent: &str) -> reqwest::blocking::Client {
+    client_opts(guard.then(|| Arc::new(Guard::from_interfaces())), user_agent, true)
+}
+
+/// Whether a redirect from `from` to `to` stays on the same host, so it is followed: the same host name
+/// (or IP), and the same port - or each URL on its own scheme's default port, so `http://a/` to
+/// `https://a/` is followed. `www.a` and `a` are different hosts.
+pub fn same_host(from: &reqwest::Url, to: &reqwest::Url) -> bool {
+    // a parsed Url drops its scheme's default port, so port() is None exactly when it is the default
+    from.host_str().map(str::to_ascii_lowercase) == to.host_str().map(str::to_ascii_lowercase)
+        && (from.port_or_known_default() == to.port_or_known_default() || (from.port().is_none() && to.port().is_none()))
+}
+
+/// The HTTP client, guarded by `guard` when there is one. Redirects are followed up to 5 hops while they
+/// stay on the first URL's host ([`same_host`]); a redirect to another host stops the fetch and is handed
+/// back (see [`fetch_or_redirect`]) unless `follow_any_host`.
+pub fn client_opts(guard: Option<Arc<Guard>>, user_agent: &str, follow_any_host: bool) -> reqwest::blocking::Client {
+    build_client(guard, user_agent, None, follow_any_host)
+}
+
+/// The one client builder: guarded by `guard` when there is one (its resolver, and every redirect), through
+/// `proxy` when there is one, following redirects on the same host only unless `follow_any_host`.
+fn build_client(
+    guard: Option<Arc<Guard>>,
+    user_agent: &str,
+    proxy: Option<reqwest::Proxy>,
+    follow_any_host: bool,
 ) -> reqwest::blocking::Client {
     let policy_guard = guard.clone();
     let redirects = reqwest::redirect::Policy::custom(move |attempt| {
@@ -274,6 +310,13 @@ pub fn client_proxied(
         if let Some(g) = &policy_guard {
             if let Err(e) = g.check_url(attempt.url()) {
                 return attempt.error(e);
+            }
+        }
+        if !follow_any_host {
+            if let Some(first) = attempt.previous().first() {
+                if !same_host(first, attempt.url()) {
+                    return attempt.stop();
+                }
             }
         }
         attempt.follow()
@@ -323,15 +366,63 @@ pub fn fetch(client: &reqwest::blocking::Client, url: &str, guard: bool) -> Resu
     fetch_with(client, url, guard.then(Guard::from_interfaces).as_ref())
 }
 
-/// GET `url`, its literal IP checked first by `guard` when there is one (as [`fetch`] does).
+/// GET `url`, its literal IP checked first by `guard` when there is one (as [`fetch`] does). A redirect
+/// to another host is an error naming the new URL (see [`fetch_or_redirect`]).
 pub fn fetch_with(client: &reqwest::blocking::Client, url: &str, guard: Option<&Guard>) -> Result<Page> {
     fetch_capped(client, url, guard, MAX_BYTES)
 }
 
 /// GET `url` as [`fetch_with`] does, reading at most `max_bytes` of the body: a Content-Length over the
 /// cap is refused before the body is read, and a body that goes on past the cap is cut there (the page
-/// is marked `truncated`). The body is decoded as UTF-8, lossily, and a cut never splits a character.
+/// is marked `truncated`). The body is decoded as UTF-8, lossily, and a cut never splits a character. A
+/// redirect to another host is an error naming the new URL.
 pub fn fetch_capped(client: &reqwest::blocking::Client, url: &str, guard: Option<&Guard>, max_bytes: usize) -> Result<Page> {
+    match fetch_or_redirect_capped(client, url, guard, max_bytes)? {
+        Fetched::Page(page) => Ok(page),
+        Fetched::Redirect(r) => Err(Error(r.message())),
+    }
+}
+
+/// A redirect to another host, not followed: the caller decides whether to fetch `to`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Redirect {
+    /// The URL whose response redirected (the last same-host hop).
+    pub from: String,
+    /// Where it redirects: the new URL, absolute.
+    pub to: String,
+    /// The redirect's status (301, 302, 303, 307, 308).
+    pub status: u16,
+}
+
+impl Redirect {
+    pub fn message(&self) -> String {
+        format!(
+            "{} redirects ({}) to another host: {} - not followed; fetch that URL yourself if you mean to",
+            self.from, self.status, self.to
+        )
+    }
+}
+
+/// What a fetch ends with: a page, or a redirect to another host that was not followed.
+#[derive(Debug)]
+pub enum Fetched {
+    Page(Page),
+    Redirect(Redirect),
+}
+
+/// GET `url` as [`fetch_with`] does, but hand back a redirect to another host as a value instead of an
+/// error. Same-host redirects were followed by the client ([`client_opts`]). At most [`MAX_BYTES`] are read.
+pub fn fetch_or_redirect(client: &reqwest::blocking::Client, url: &str, guard: Option<&Guard>) -> Result<Fetched> {
+    fetch_or_redirect_capped(client, url, guard, MAX_BYTES)
+}
+
+/// [`fetch_or_redirect`] reading at most `max_bytes` of the body, as [`fetch_capped`] does.
+pub fn fetch_or_redirect_capped(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    guard: Option<&Guard>,
+    max_bytes: usize,
+) -> Result<Fetched> {
     use std::io::Read;
     let parsed = reqwest::Url::parse(url).map_err(|e| Error(format!("not a URL: {url} ({e})")))?;
     if let Some(g) = guard {
@@ -340,6 +431,16 @@ pub fn fetch_capped(client: &reqwest::blocking::Client, url: &str, guard: Option
     let resp = client.get(parsed).send().map_err(|e| Error(format!("error fetching {url}: {}", chain(&e))))?;
     let status = resp.status();
     let final_url = resp.url().to_string();
+    if status.is_redirection() {
+        let to = resp
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|l| l.to_str().ok())
+            .and_then(|l| resp.url().join(l).ok());
+        if let Some(to) = to.filter(|to| !same_host(resp.url(), to)) {
+            return Ok(Fetched::Redirect(Redirect { from: final_url, to: to.to_string(), status: status.as_u16() }));
+        }
+    }
     if !status.is_success() {
         return Err(Error(format!("HTTP {status} from {final_url}")));
     }
@@ -359,7 +460,7 @@ pub fn fetch_capped(client: &reqwest::blocking::Client, url: &str, guard: Option
         buf.truncate(utf8_cut(&buf, max_bytes));
     }
     let body = String::from_utf8_lossy(&buf).into_owned();
-    Ok(Page { url: final_url, body, truncated, max_bytes })
+    Ok(Fetched::Page(Page { url: final_url, body, truncated, max_bytes }))
 }
 
 /// Where to cut `bytes` at no more than `limit`, backed off so a UTF-8 character is not split.

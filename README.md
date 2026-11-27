@@ -56,6 +56,22 @@ webfetch still refuses a private or local literal IP in the URL and on redirects
 resolves and reaches host names, so the proxy has to refuse private addresses itself. (The library
 side is in place; the CLI and MCP flag still has to be wired in `src/main.rs`.)
 
+## Redirects to another host are not followed
+
+An open redirect on a site you trust (`https://trusted.example/out?to=...`) must not lead a fetch
+anywhere it likes. So webfetch follows a redirect only while it stays on the same host, `http` to
+`https` on that host included, up to 5 hops. A redirect to another host (`www.` and a different port
+count as another host) stops the fetch, and the new URL is handed back instead of fetched:
+
+- the CLI prints `webfetch: <url> redirects (302) to another host: <new url> - not followed; ...` on
+  stderr and exits with status 1, so you can fetch the new URL yourself if you trust it;
+- `fetch_page` returns an `isError` result whose `structuredContent` carries `redirect_url` (with `url`,
+  the URL that redirected, and `status`), and whose text names it too, so the agent makes a new,
+  deliberate call.
+
+The library's `client_following` follows redirects to any host, as webfetch used to (the private-address
+guard still checks every hop); a `--follow-redirects` flag for the CLI is still to be wired in `main.rs`.
+
 ## Search
 
 `--search` asks a [SearXNG](https://docs.searxng.org/) instance through its JSON API
@@ -84,7 +100,8 @@ Code Mode):
 - each call runs on its own thread, so `Promise.all` over many pages runs them in parallel;
 - they are annotated read-only, idempotent and open-world (Claude Code runs read-only calls in
   parallel), and `fetch_page` declares `anthropic/maxResultSizeChars` so a large slice stays inline;
-- mistakes an agent can fix come back as `isError` results it can read and retry from;
+- mistakes an agent can fix come back as `isError` results it can read and retry from; a redirect to
+  another host comes back that way too, carrying `redirect_url` for a new call;
 - the private-address guard and the URL gate below belong to whoever starts the server; no tool
   argument turns them off, and every result carries the notice that web content is data, not instructions.
 
@@ -147,7 +164,8 @@ Wikimedia and others ask of scripts. `--user-agent` sends another, for a site th
 
 - `0`: the page or the results were printed
 - `1`: the fetch failed (network error, an HTTP status outside 2xx, a refused private address, a body
-  whose Content-Length is over `--max-bytes`, a search with no results); the reason is on stderr
+  whose Content-Length is over `--max-bytes`, a redirect to another host, a search with no results); the
+  reason is on stderr
 - `2`: the command line was wrong (for example neither a URL nor `--search`)
 
 ## Limits

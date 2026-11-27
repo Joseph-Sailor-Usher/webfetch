@@ -87,7 +87,8 @@ fn refuses_this_machines_own_address() {
     assert!(guard.check_url(&reqwest::Url::parse("http://public.test/").unwrap()).is_ok());
 
     // on redirect: a server (reached unchecked, straight through the client) sends the fetch to the
-    // machine's own address by IP, then by name; the guarded client's redirect policy refuses both
+    // machine's own address by IP, then by name; a guarded client that follows redirects to other hosts
+    // (--follow-redirects) refuses both (one that does not hands the redirect back unfetched)
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     std::thread::spawn(move || {
@@ -100,7 +101,7 @@ fn refuses_this_machines_own_address() {
             s.write_all(reply.as_bytes()).unwrap();
         }
     });
-    let c = client_with(Some(Arc::new(guard.clone())), USER_AGENT);
+    let c = client_opts(Some(Arc::new(guard.clone())), USER_AGENT, true);
     for _ in 0..2 {
         let err = fetch_with(&c, &format!("http://127.0.0.1:{port}/"), None).unwrap_err();
         assert!(err.0.contains("this machine's own address"), "{err}");
@@ -280,6 +281,95 @@ fn caps_the_body_it_reads() {
 
     // the cut backs off to the start of a character it would split, and never past the body's end
     assert!(utf8_cut("aé".as_bytes(), 2) == 1 && utf8_cut(b"abc", 5) == 3);
+}
+
+#[test]
+fn does_not_follow_a_redirect_to_another_host() {
+    use std::io::{Read, Write};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let u = |s: &str| reqwest::Url::parse(s).unwrap();
+    // the rule: same host, http to https on it included; another name, port or subdomain is another host
+    assert!(same_host(&u("http://example.com/a"), &u("https://EXAMPLE.com/b")));
+    assert!(same_host(&u("http://example.com:8080/a"), &u("http://example.com:8080/b")));
+    assert!(!same_host(&u("http://example.com/a"), &u("http://example.com:8080/a")));
+    assert!(!same_host(&u("https://example.com/a"), &u("https://www.example.com/a")));
+    assert!(!same_host(&u("https://trusted.example/a"), &u("https://evil.example/a")));
+
+    // the other host: it must never be asked for anything
+    let other = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let other_port = other.local_addr().unwrap().port();
+    let other_hits = Arc::new(AtomicUsize::new(0));
+    let hits = other_hits.clone();
+    std::thread::spawn(move || {
+        for stream in other.incoming() {
+            hits.fetch_add(1, Ordering::SeqCst);
+            let mut s = stream.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = s.read(&mut buf);
+            let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nother");
+        }
+    });
+    // the trusted host (127.0.0.1): /same redirects on itself, /away (via /hop) to localhost, another host
+    let away = format!("http://localhost:{other_port}/landing");
+    let trusted = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://127.0.0.1:{}", trusted.local_addr().unwrap().port());
+    let to = away.clone();
+    std::thread::spawn(move || {
+        for stream in trusted.incoming() {
+            let mut s = stream.unwrap();
+            let mut buf = [0u8; 2048];
+            let n = s.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            let path = req.split_whitespace().nth(1).unwrap_or("/").to_string();
+            let reply = match path.as_str() {
+                "/same" => "HTTP/1.1 301 Moved Permanently\r\nLocation: /page\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+                "/page" => "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nhere".to_string(),
+                "/hop" => "HTTP/1.1 302 Found\r\nLocation: /away\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+                _ => format!("HTTP/1.1 302 Found\r\nLocation: {to}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
+            };
+            let _ = s.write_all(reply.as_bytes());
+        }
+    });
+    let c = client(false, USER_AGENT);
+
+    // a same-host redirect is followed
+    let page = fetch(&c, &format!("{base}/same"), false).unwrap();
+    assert_eq!((page.url.as_str(), page.body.as_str()), (format!("{base}/page").as_str(), "here"));
+
+    // a cross-host one (after a same-host hop) is returned, not fetched
+    match fetch_or_redirect(&c, &format!("{base}/hop"), None).unwrap() {
+        Fetched::Redirect(r) => assert_eq!(r, Redirect { from: format!("{base}/away"), to: away.clone(), status: 302 }),
+        Fetched::Page(p) => panic!("followed the redirect to {}", p.url),
+    }
+    // through fetch (the CLI's path) it is an error naming the new URL
+    let err = fetch(&c, &format!("{base}/away"), false).unwrap_err();
+    assert!(err.0.contains(&away) && err.0.contains("another host"), "{err}");
+
+    // the MCP tool: an isError result carrying redirect_url
+    // card-2's gate: the operator allows this exact URL (--allow-url), as a search result would
+    let s = mcp::Settings {
+        searx: String::new(),
+        allow_private: true,
+        user_agent: USER_AGENT.into(),
+        allow_urls: vec![format!("{base}/away")],
+        allow_domains: vec![],
+        max_fetches: 50,
+        session: Default::default(),
+    };
+    let call = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                  "params": {"name": "fetch_page", "arguments": {"url": format!("{base}/away")}}});
+    let result = &mcp::handle(&call, &s).unwrap()["result"];
+    assert_eq!(result["isError"], true, "{result}");
+    assert_eq!(result["structuredContent"]["redirect_url"], away.as_str(), "{result}");
+    assert!(result["content"][0]["text"].as_str().unwrap().contains(&away), "{result}");
+
+    // the other host never saw a request
+    assert_eq!(other_hits.load(Ordering::SeqCst), 0);
+
+    // and client_following follows it, as before (the CLI's --follow-redirects)
+    let page = fetch(&client_following(false, USER_AGENT), &format!("{base}/away"), false).unwrap();
+    assert_eq!(page.body, "other");
+    assert_eq!(other_hits.load(Ordering::SeqCst), 1);
 }
 
 #[test]
