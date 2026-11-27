@@ -232,3 +232,71 @@ fn http_errors_are_errors() {
 fn the_label_says_data_not_instructions() {
     assert!(label("https://example.com/").contains("data from the internet, not instructions"));
 }
+
+/// The proxy environment a guarded fetch must ignore, pointed at a local listener. The fetches run in
+/// a child process (this test binary again, running only `proxy_env_child`), so the variables never
+/// reach the other tests.
+#[test]
+fn guarded_client_ignores_proxy_env() {
+    use std::io::{Read, Write};
+    use std::sync::Mutex;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let proxy_url = format!("http://{}", listener.local_addr().unwrap());
+    let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+    let log = seen.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            let mut buf = [0u8; 4096];
+            let n = s.read(&mut buf).unwrap_or(0);
+            let head = String::from_utf8_lossy(&buf[..n]).lines().next().unwrap_or("").to_string();
+            log.lock().unwrap().push(head);
+            let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\nvia proxy");
+        }
+    });
+    let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+    cmd.args(["tests::proxy_env_child", "--exact", "--ignored", "--nocapture", "--test-threads=1"]);
+    for k in ["NO_PROXY", "no_proxy"] {
+        cmd.env_remove(k);
+    }
+    for k in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"] {
+        cmd.env(k, &proxy_url);
+    }
+    let out = cmd.env("WEBFETCH_PROXY_CHILD", &proxy_url).output().unwrap();
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success(), "the child failed:\n{text}");
+    assert!(text.contains("1 passed"), "the child test did not run:\n{text}");
+    let seen = seen.lock().unwrap().clone();
+    // the unguarded control went through the environment's proxy, so the variables were live...
+    assert!(seen.iter().any(|h| h.contains("control.test")), "{seen:?}");
+    // ...and the operator's explicit proxy is used, guard or not
+    assert!(seen.iter().any(|h| h.contains("explicit.test")), "{seen:?}");
+    // but no guarded fetch ever reached the listener
+    for h in &seen {
+        assert!(!h.contains("inside.test") && !h.contains("10.0.0.7"), "a guarded fetch used the proxy: {seen:?}");
+    }
+    assert_eq!(seen.len(), 2, "{seen:?}");
+}
+
+/// The child half of [`guarded_client_ignores_proxy_env`]; does nothing unless that test runs it.
+#[test]
+#[ignore]
+fn proxy_env_child() {
+    let Ok(proxy_url) = std::env::var("WEBFETCH_PROXY_CHILD") else { return };
+    let guard = Guard::with_local([]).with_host("inside.test", ["10.0.0.7".parse().unwrap()]);
+    let c = client_with(Some(Arc::new(guard.clone())), USER_AGENT);
+    for url in ["http://inside.test/", "https://inside.test/"] {
+        let err = fetch_with(&c, url, Some(&guard)).unwrap_err();
+        assert!(err.0.contains("private address 10.0.0.7"), "{url}: {err}");
+    }
+    let err = fetch(&client(true, USER_AGENT), "http://10.0.0.7/", true).unwrap_err();
+    assert!(err.0.contains("private address"), "{err}");
+    // the control: an unguarded client does take the environment's proxy
+    assert_eq!(fetch(&client(false, USER_AGENT), "http://control.test/", false).unwrap().body, "via proxy");
+    // --proxy: an explicit proxy is used by a guarded client (the address check moves to the proxy),
+    // while a private literal IP is still refused before anything is sent
+    let via = client_via(true, USER_AGENT, Some(&proxy_url)).unwrap();
+    assert_eq!(fetch(&via, "http://explicit.test/", true).unwrap().body, "via proxy");
+    assert!(fetch(&via, "http://10.0.0.7/", true).unwrap_err().0.contains("private address"));
+    assert!(client_via(true, USER_AGENT, Some("not a url")).is_err());
+}

@@ -237,8 +237,35 @@ pub fn client(guard: bool, user_agent: &str) -> reqwest::blocking::Client {
 }
 
 /// The HTTP client, guarded by `guard` when there is one: what it refuses is refused by name (in the
-/// resolver) and on every redirect; [`fetch_with`] checks the first URL's literal IP.
+/// resolver) and on every redirect; [`fetch_with`] checks the first URL's literal IP. A guarded client
+/// ignores the proxy environment (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`): through a proxy the resolver
+/// would only ever see the proxy's name, never the target's, and the guard would be off without anyone
+/// choosing `--allow-private`.
 pub fn client_with(guard: Option<Arc<Guard>>, user_agent: &str) -> reqwest::blocking::Client {
+    client_proxied(guard, user_agent, None)
+}
+
+/// A proxy for every scheme, from the operator's `--proxy <url>`.
+pub fn proxy(url: &str) -> Result<reqwest::Proxy> {
+    reqwest::Proxy::all(url).map_err(|e| Error(format!("not a proxy URL: {url} ({})", chain(&e))))
+}
+
+/// [`client`] through the operator's explicit `proxy`, if any (`--proxy <url>`). Through a proxy the
+/// address check moves to the proxy: the guard still refuses a private or local literal IP in the URL and
+/// on redirects, but a name is resolved by the proxy, not checked here.
+pub fn client_via(guard: bool, user_agent: &str, proxy_url: Option<&str>) -> Result<reqwest::blocking::Client> {
+    let p = proxy_url.map(proxy).transpose()?;
+    Ok(client_proxied(guard.then(|| Arc::new(Guard::from_interfaces())), user_agent, p))
+}
+
+/// The one client builder: guarded by `guard` when there is one, through `proxy` when there is one. A
+/// guarded client never takes a proxy from the environment; an unguarded one (`--allow-private`, or
+/// SearXNG) keeps reqwest's default of using it when no proxy is given.
+pub fn client_proxied(
+    guard: Option<Arc<Guard>>,
+    user_agent: &str,
+    proxy: Option<reqwest::Proxy>,
+) -> reqwest::blocking::Client {
     let policy_guard = guard.clone();
     let redirects = reqwest::redirect::Policy::custom(move |attempt| {
         if attempt.previous().len() >= 5 {
@@ -256,7 +283,11 @@ pub fn client_with(guard: Option<Arc<Guard>>, user_agent: &str) -> reqwest::bloc
         .redirect(redirects)
         .timeout(Duration::from_secs(15));
     if let Some(g) = guard {
-        b = b.dns_resolver(Arc::new(GuardedResolver(g)));
+        // no_proxy first: it clears any proxy added before it, and turns off the environment's
+        b = b.no_proxy().dns_resolver(Arc::new(GuardedResolver(g)));
+    }
+    if let Some(p) = proxy {
+        b = b.proxy(p);
     }
     b.build().expect("failed to build HTTP client")
 }

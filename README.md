@@ -47,6 +47,15 @@ covers. All of these are refused whether the URL names them as an IP, as a host 
 that resolves to one (checked in the DNS resolver itself, so a DNS answer cannot slip through), or
 through a redirect. Only `http` and `https` are fetched. `--allow-private` turns the guard off.
 
+The guard ignores the proxy environment: `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` are not used
+while it is on. Through a proxy, webfetch resolves only the proxy's name and never the target's, so the
+target's address would never be checked. A proxy set in an agent's environment or a config file would
+then turn the guard off without anyone choosing `--allow-private`. If you really need a proxy, name it
+yourself with `--proxy <url>` (the library's `client_via`). The address check then moves to the proxy:
+webfetch still refuses a private or local literal IP in the URL and on redirects, but the proxy
+resolves and reaches host names, so the proxy has to refuse private addresses itself. (The library
+side is in place; the CLI and MCP flag still has to be wired in `src/main.rs`.)
+
 ## Search
 
 `--search` asks a [SearXNG](https://docs.searxng.org/) instance through its JSON API
