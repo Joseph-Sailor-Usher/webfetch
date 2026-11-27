@@ -119,6 +119,7 @@ fn both_handshakes_and_the_tool_list() {
         assert_eq!(t["inputSchema"]["additionalProperties"], false, "{t}");
         assert_eq!(t["annotations"], json!({"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true}));
     }
+    assert_eq!(list["tools"][0]["_meta"]["anthropic/maxResultSizeChars"], 250_000);
     assert_eq!(s.request(5, "ping", json!({}))["result"]["resultType"], "complete");
 }
 
