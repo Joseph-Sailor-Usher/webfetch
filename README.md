@@ -39,7 +39,11 @@ The article, as Markdown...
 A page (or a prompt-injected agent) must not be able to point webfetch at this machine or this network:
 the LLM servers, admin panels and cloud metadata that answer there. So webfetch refuses loopback,
 private, link-local, carrier-grade NAT and other reserved addresses (IPv4 and IPv6, including
-IPv4-mapped and 6to4 forms, and `169.254.169.254`), whether the URL names them as an IP, as a host name
+IPv4-mapped and 6to4 forms, and `169.254.169.254`), and any address held by one of this machine's own
+network interfaces, IPv4 or IPv6 (read from the interfaces when the client is built, with a bind check
+for any added since). That last part matters: a machine with a public IPv6 address reaches every service
+bound to `0.0.0.0` or `[::]` (an Ollama server, say) through that address, which no private range
+covers. All of these are refused whether the URL names them as an IP, as a host name
 that resolves to one (checked in the DNS resolver itself, so a DNS answer cannot slip through), or
 through a redirect. Only `http` and `https` are fetched. `--allow-private` turns the guard off.
 

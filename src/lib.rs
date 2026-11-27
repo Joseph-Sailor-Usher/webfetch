@@ -2,8 +2,8 @@
 //!
 //! - The main content is found with dom_smoothie (a port of Mozilla's Readability.js) and converted to
 //!   Markdown with htmd (a port of turndown.js); links come out absolute.
-//! - Page fetches refuse private, loopback, link-local and metadata addresses (by name, by literal IP and
-//!   on every redirect), so a page cannot steer an agent into this machine's or this network's services.
+//! - Page fetches refuse private, loopback, link-local and metadata addresses, and this machine's own
+//!   addresses (by name, by literal IP and on every redirect), so a page cannot steer an agent into this machine's or this network's services.
 //! - Output can carry a label saying it is web content: data, not instructions.
 
 pub mod mcp;
@@ -11,6 +11,7 @@ pub mod mcp;
 use ego_tree::NodeRef;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use scraper::{Html, Node, Selector};
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::Duration;
@@ -72,35 +73,153 @@ fn literal_ip(url: &reqwest::Url) -> Option<IpAddr> {
     url.host_str()?.trim_start_matches('[').trim_end_matches(']').parse().ok()
 }
 
-/// Refuse a URL that is not http(s) or whose host is a private literal IP (names are checked by
-/// [`GuardedResolver`]).
-pub fn check_url(url: &reqwest::Url) -> Result<()> {
-    if !matches!(url.scheme(), "http" | "https") {
-        return Err(Error(format!("refusing {url}: only http and https are fetched")));
-    }
-    if let Some(ip) = literal_ip(url) {
-        if is_private(ip) {
-            return Err(Error(format!("refusing {url}: {ip} is a private address (--allow-private to fetch it)")));
-        }
-    }
-    Ok(())
+/// What the guard refuses: every [`is_private`] address, and every address this machine's own network
+/// interfaces hold - a public IPv6 (or IPv4) address of this machine reaches any service bound to all
+/// interfaces (`0.0.0.0`, `[::]`), such as a local model server, as surely as loopback does.
+#[derive(Clone, Debug, Default)]
+pub struct Guard {
+    local: HashSet<IpAddr>,
+    hosts: HashMap<String, Vec<IpAddr>>,
 }
 
-/// Resolves a host name and refuses it if any of its addresses is private, so neither a redirect nor
-/// a DNS answer can lead a fetch inside.
-struct GuardedResolver;
+impl Guard {
+    /// The guard for this machine: its interfaces' addresses, read now.
+    pub fn from_interfaces() -> Guard {
+        Guard::with_local(local_addrs())
+    }
+
+    /// A guard that takes `addrs` for this machine's own addresses (tests inject them here).
+    pub fn with_local(addrs: impl IntoIterator<Item = IpAddr>) -> Guard {
+        Guard { local: addrs.into_iter().map(canonical).collect(), hosts: HashMap::new() }
+    }
+
+    /// Answer `host` with `addrs` instead of asking DNS (for tests: a name that resolves to a given address).
+    pub fn with_host(mut self, host: &str, addrs: impl IntoIterator<Item = IpAddr>) -> Guard {
+        self.hosts.insert(host.to_ascii_lowercase(), addrs.into_iter().collect());
+        self
+    }
+
+    /// Whether this machine holds `ip`: read from its interfaces when the guard was made, and - for an
+    /// address added since, or a system whose interfaces could not be read - whether it can bind to it.
+    pub fn is_local(&self, ip: IpAddr) -> bool {
+        let ip = canonical(ip);
+        self.local.contains(&ip) || (!ip.is_unspecified() && std::net::UdpSocket::bind(SocketAddr::new(ip, 0)).is_ok())
+    }
+
+    /// Whether a fetch must not reach `ip`: a private address or one of this machine's own.
+    pub fn refuses(&self, ip: IpAddr) -> bool {
+        is_private(ip) || self.is_local(ip)
+    }
+
+    /// Refuse a URL that is not http(s) or whose host is a refused literal IP (names are checked by
+    /// [`Guard::lookup`], in the guarding client's resolver).
+    pub fn check_url(&self, url: &reqwest::Url) -> Result<()> {
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(Error(format!("refusing {url}: only http and https are fetched")));
+        }
+        if let Some(ip) = literal_ip(url) {
+            if is_private(ip) {
+                return Err(Error(format!("refusing {url}: {ip} is a private address (--allow-private to fetch it)")));
+            }
+            if self.is_local(ip) {
+                return Err(Error(format!(
+                    "refusing {url}: {ip} is this machine's own address, a private address (--allow-private to fetch it)"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve `host`, refusing it if any of its addresses is refused.
+    pub fn lookup(&self, host: &str) -> Result<Vec<SocketAddr>> {
+        let addrs: Vec<SocketAddr> = match self.hosts.get(&host.to_ascii_lowercase()) {
+            Some(ips) => ips.iter().map(|ip| SocketAddr::new(*ip, 0)).collect(),
+            None => (host, 0).to_socket_addrs().map_err(|e| Error(format!("cannot resolve {host}: {e}")))?.collect(),
+        };
+        for a in &addrs {
+            let ip = a.ip();
+            if is_private(ip) {
+                return Err(Error(format!(
+                    "refusing {host}: it resolves to the private address {ip} (--allow-private to fetch it)"
+                )));
+            }
+            if self.is_local(ip) {
+                return Err(Error(format!(
+                    "refusing {host}: it resolves to {ip}, this machine's own address, a private address (--allow-private to fetch it)"
+                )));
+            }
+        }
+        Ok(addrs)
+    }
+}
+
+/// An IPv4-mapped IPv6 address as the IPv4 address it is, so either form matches.
+fn canonical(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
+        v4 => v4,
+    }
+}
+
+/// The addresses this machine's network interfaces hold, IPv4 and IPv6 (Linux: from /proc; elsewhere
+/// none are read and [`Guard::is_local`]'s bind check stands alone).
+pub fn local_addrs() -> Vec<IpAddr> {
+    let mut out = Vec::new();
+    if let Ok(v6) = std::fs::read_to_string("/proc/net/if_inet6") {
+        out.extend(parse_if_inet6(&v6));
+    }
+    if let Ok(trie) = std::fs::read_to_string("/proc/net/fib_trie") {
+        out.extend(parse_fib_trie(&trie));
+    }
+    out
+}
+
+/// The addresses in /proc/net/if_inet6 (the first field of each line: 32 hex digits).
+pub fn parse_if_inet6(text: &str) -> Vec<IpAddr> {
+    text.lines()
+        .filter_map(|l| {
+            let hex = l.split_whitespace().next()?;
+            let n = u128::from_str_radix(hex, 16).ok().filter(|_| hex.len() == 32)?;
+            Some(IpAddr::V6(std::net::Ipv6Addr::from(n)))
+        })
+        .collect()
+}
+
+/// The IPv4 addresses /proc/net/fib_trie marks `/32 host LOCAL`: the ones this machine's interfaces hold.
+pub fn parse_fib_trie(text: &str) -> Vec<IpAddr> {
+    let mut out = Vec::new();
+    let mut last: Option<IpAddr> = None;
+    for line in text.lines() {
+        let t = line.trim_start_matches([' ', '|', '+', '-', '`']).trim();
+        if let Ok(ip) = t.parse::<std::net::Ipv4Addr>() {
+            last = Some(IpAddr::V4(ip));
+        } else if t.starts_with("/32 host LOCAL") {
+            if let Some(ip) = last {
+                if !out.contains(&ip) {
+                    out.push(ip);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Refuse a URL that is not http(s) or whose host is a private literal IP or one of this machine's own
+/// addresses (names are checked by the guarding client's resolver).
+pub fn check_url(url: &reqwest::Url) -> Result<()> {
+    Guard::from_interfaces().check_url(url)
+}
+
+/// Resolves a host name through its [`Guard`] and refuses it if any of its addresses is private or this
+/// machine's own, so neither a redirect nor a DNS answer can lead a fetch inside.
+struct GuardedResolver(Arc<Guard>);
 
 impl Resolve for GuardedResolver {
     fn resolve(&self, name: Name) -> Resolving {
         let host = name.as_str().to_string();
+        let guard = self.0.clone();
         Box::pin(async move {
-            let addrs: Vec<SocketAddr> = (host.as_str(), 0).to_socket_addrs()?.collect();
-            if let Some(bad) = addrs.iter().find(|a| is_private(a.ip())) {
-                return Err(Box::new(Error(format!(
-                    "refusing {host}: it resolves to the private address {} (--allow-private to fetch it)",
-                    bad.ip()
-                ))) as Box<dyn std::error::Error + Send + Sync>);
-            }
+            let addrs = guard.lookup(&host).map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
             Ok(Box::new(addrs.into_iter()) as Addrs)
         })
     }
@@ -111,14 +230,22 @@ impl Resolve for GuardedResolver {
 pub const USER_AGENT: &str =
     concat!("webfetch/", env!("CARGO_PKG_VERSION"), " (+https://github.com/Joseph-Sailor-Usher/webfetch)");
 
-/// The HTTP client. With `guard`, private addresses are refused by name, by literal IP and on redirects.
+/// The HTTP client. With `guard`, private addresses and this machine's own (read from its interfaces
+/// now) are refused by name, by literal IP and on redirects.
 pub fn client(guard: bool, user_agent: &str) -> reqwest::blocking::Client {
+    client_with(guard.then(|| Arc::new(Guard::from_interfaces())), user_agent)
+}
+
+/// The HTTP client, guarded by `guard` when there is one: what it refuses is refused by name (in the
+/// resolver) and on every redirect; [`fetch_with`] checks the first URL's literal IP.
+pub fn client_with(guard: Option<Arc<Guard>>, user_agent: &str) -> reqwest::blocking::Client {
+    let policy_guard = guard.clone();
     let redirects = reqwest::redirect::Policy::custom(move |attempt| {
         if attempt.previous().len() >= 5 {
             return attempt.error("too many redirects");
         }
-        if guard {
-            if let Err(e) = check_url(attempt.url()) {
+        if let Some(g) = &policy_guard {
+            if let Err(e) = g.check_url(attempt.url()) {
                 return attempt.error(e);
             }
         }
@@ -128,8 +255,8 @@ pub fn client(guard: bool, user_agent: &str) -> reqwest::blocking::Client {
         .user_agent(user_agent)
         .redirect(redirects)
         .timeout(Duration::from_secs(15));
-    if guard {
-        b = b.dns_resolver(Arc::new(GuardedResolver));
+    if let Some(g) = guard {
+        b = b.dns_resolver(Arc::new(GuardedResolver(g)));
     }
     b.build().expect("failed to build HTTP client")
 }
@@ -144,9 +271,14 @@ pub struct Page {
 /// GET `url`. A status outside 2xx is an error, not a page. With `guard`, a private literal IP is
 /// refused before anything is sent (names are refused by the guarding client's resolver).
 pub fn fetch(client: &reqwest::blocking::Client, url: &str, guard: bool) -> Result<Page> {
+    fetch_with(client, url, guard.then(Guard::from_interfaces).as_ref())
+}
+
+/// GET `url`, its literal IP checked first by `guard` when there is one (as [`fetch`] does).
+pub fn fetch_with(client: &reqwest::blocking::Client, url: &str, guard: Option<&Guard>) -> Result<Page> {
     let parsed = reqwest::Url::parse(url).map_err(|e| Error(format!("not a URL: {url} ({e})")))?;
-    if guard {
-        check_url(&parsed)?;
+    if let Some(g) = guard {
+        g.check_url(&parsed)?;
     }
     let resp = client.get(parsed).send().map_err(|e| Error(format!("error fetching {url}: {}", chain(&e))))?;
     let status = resp.status();

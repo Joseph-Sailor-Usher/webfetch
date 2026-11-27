@@ -51,6 +51,79 @@ fn the_guarded_client_refuses_a_name_that_resolves_inside() {
 }
 
 #[test]
+fn refuses_this_machines_own_address() {
+    use std::io::{Read, Write};
+    // A global-scope address no private range covers, held (as the test says) by a local interface -
+    // like a public IPv6 that reaches a model server bound to [::] - and its IPv4 twin.
+    let own6: IpAddr = "2001:db8:a5::7".parse().unwrap();
+    let own4: IpAddr = "203.0.113.7".parse().unwrap();
+    let public: IpAddr = "2606:4700:4700::1111".parse().unwrap();
+    assert!(!is_private(own6) && !is_private(own4) && !is_private(public));
+    let guard = Guard::with_local([own6, own4])
+        .with_host("own.test", [own6])
+        .with_host("own4.test", [own4])
+        .with_host("public.test", [public]);
+    assert!(guard.refuses(own6) && guard.refuses(own4) && guard.refuses("::ffff:203.0.113.7".parse().unwrap()));
+    assert!(!guard.refuses(public));
+
+    // by literal IP
+    for url in ["http://[2001:db8:a5::7]:11434/api/tags", "http://203.0.113.7:11434/api/tags"] {
+        let err = guard.check_url(&reqwest::Url::parse(url).unwrap()).unwrap_err();
+        assert!(err.0.contains("this machine's own address"), "{err}");
+        let err = fetch_with(&client_with(Some(Arc::new(guard.clone())), USER_AGENT), url, Some(&guard)).unwrap_err();
+        assert!(err.0.contains("this machine's own address"), "{err}");
+    }
+    assert!(guard.check_url(&reqwest::Url::parse("http://[2606:4700:4700::1111]/").unwrap()).is_ok());
+
+    // by resolution: in the guard and through the guarded client's resolver
+    for host in ["own.test", "own4.test"] {
+        let err = guard.lookup(host).unwrap_err();
+        assert!(err.0.contains("this machine's own address"), "{err}");
+        let c = client_with(Some(Arc::new(guard.clone())), USER_AGENT);
+        let err = fetch_with(&c, &format!("http://{host}:11434/api/tags"), Some(&guard)).unwrap_err();
+        assert!(err.0.contains("this machine's own address"), "{err}");
+    }
+    assert_eq!(guard.lookup("public.test").unwrap()[0].ip(), public);
+    assert!(guard.check_url(&reqwest::Url::parse("http://public.test/").unwrap()).is_ok());
+
+    // on redirect: a server (reached unchecked, straight through the client) sends the fetch to the
+    // machine's own address by IP, then by name; the guarded client's redirect policy refuses both
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for (i, stream) in listener.incoming().take(2).enumerate() {
+            let mut s = stream.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = s.read(&mut buf);
+            let to = if i == 0 { "http://[2001:db8:a5::7]:11434/api/tags" } else { "http://own.test:11434/api/tags" };
+            let reply = format!("HTTP/1.1 302 Found\r\nLocation: {to}\r\nContent-Length: 0\r\n\r\n");
+            s.write_all(reply.as_bytes()).unwrap();
+        }
+    });
+    let c = client_with(Some(Arc::new(guard.clone())), USER_AGENT);
+    for _ in 0..2 {
+        let err = fetch_with(&c, &format!("http://127.0.0.1:{port}/"), None).unwrap_err();
+        assert!(err.0.contains("this machine's own address"), "{err}");
+    }
+
+    // the interface tables parse
+    let v6 = "20010db800a500000000000000000007 03 40 00 00 wlp131s0\n00000000000000000000000000000001 01 80 10 80 lo\n";
+    assert_eq!(parse_if_inet6(v6), vec![own6, "::1".parse::<IpAddr>().unwrap()]);
+    let trie = "Main:\n  +-- 0.0.0.0/0 3 0 5\n     |-- 203.0.113.0\n        /24 link UNICAST\n     |-- 203.0.113.7\n        /32 host LOCAL\n";
+    assert_eq!(parse_fib_trie(trie), vec![own4]);
+}
+
+#[test]
+fn this_machines_interfaces_are_read() {
+    // whatever this machine's interfaces hold, the default guard refuses it
+    let addrs = local_addrs();
+    let guard = Guard::from_interfaces();
+    for ip in addrs {
+        assert!(guard.refuses(ip), "{ip}");
+    }
+}
+
+#[test]
 fn readability_finds_the_article_and_markdown_keeps_absolute_links() {
     let c = content(ARTICLE, "https://news.example.com/lighthouses", Format::Markdown, false);
     assert!(c.article);
