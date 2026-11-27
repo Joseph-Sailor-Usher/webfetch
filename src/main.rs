@@ -4,7 +4,7 @@ use webfetch::{client, content, fetch, format_hits, label, search, truncate_char
 #[derive(Parser)]
 #[command(name = "webfetch", version)]
 #[command(about = "Fetch a web page and print its main content as Markdown, or search through SearXNG")]
-#[command(group(ArgGroup::new("target").required(true).args(["url", "search"])))]
+#[command(group(ArgGroup::new("target").required(true).args(["url", "search", "mcp"])))]
 struct Cli {
     /// URL to fetch
     url: Option<String>,
@@ -12,6 +12,11 @@ struct Cli {
     /// Search query, answered by a SearXNG instance
     #[arg(short, long)]
     search: Option<String>,
+
+    /// Run as an MCP server on stdio (tools: fetch_page, search); --searx, --allow-private and
+    /// --user-agent apply to every call
+    #[arg(long, conflicts_with_all = ["text", "full", "raw", "no_label", "lines"])]
+    mcp: bool,
 
     /// SearXNG base URL for --search
     #[arg(long, env = "WEBFETCH_SEARXNG", default_value = "http://127.0.0.1:8888")]
@@ -48,6 +53,14 @@ struct Cli {
 
 fn main() {
     let cli = Cli::parse();
+    if cli.mcp {
+        webfetch::mcp::serve(webfetch::mcp::Settings {
+            searx: cli.searx.clone(),
+            allow_private: cli.allow_private,
+            user_agent: cli.user_agent.clone(),
+        });
+        return;
+    }
     if let Err(e) = run(&cli) {
         eprintln!("webfetch: {e}");
         std::process::exit(1);
