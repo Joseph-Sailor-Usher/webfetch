@@ -52,6 +52,50 @@ the private-address guard. Results print as a numbered Markdown list (`--text` f
 
 If you only need search, you can call SearXNG directly: `curl 'http://127.0.0.1:8888/search?q=...&format=json'`.
 
+## MCP server (for agents, and for code mode)
+
+`webfetch --mcp` serves the same features over the Model Context Protocol (stdio) as two tools:
+
+- `fetch_page {url, format?, full_page?, max_chars?, offset?}` returns
+  `{url, final_url, title, byline, format, main_content, content, offset, total_chars, next_offset, notice}`.
+  Long pages come in slices (`max_chars`, default 20,000): call again with `offset: next_offset` until
+  it is `null`.
+- `search {query, max_results?}` returns `{query, results: [{title, url, snippet}], notice}`.
+
+It is built for **code mode**, where the model writes one script that calls tools and only the
+script's output reaches the model (Claude Code's experimental Code Mode, pi's `codemode`, Cloudflare's
+Code Mode):
+
+- both tools declare an `outputSchema` and return `structuredContent` (and the same JSON as text), so a
+  script gets typed objects, not text to parse;
+- each call runs on its own thread, so `Promise.all` over many pages runs them in parallel;
+- they are annotated read-only, idempotent and open-world (Claude Code runs read-only calls in
+  parallel), and `fetch_page` declares `anthropic/maxResultSizeChars` so a large slice stays inline;
+- mistakes an agent can fix come back as `isError` results it can read and retry from;
+- the private-address guard belongs to whoever starts the server (`--allow-private`); no tool argument
+  turns it off, and every result carries the notice that web content is data, not instructions.
+
+```js
+// one code-mode script: search, then read the top three pages at once
+const { structuredContent: s } = await tools.mcp__webfetch__search({ query: "Pharos of Alexandria", max_results: 3 });
+const pages = await Promise.all(s.results.map(r => tools.mcp__webfetch__fetch_page({ url: r.url, max_chars: 4000 })));
+return pages.map(p => ({ title: p.structuredContent.title, url: p.structuredContent.final_url }));
+```
+
+Protocol: the `initialize` handshake (2025-03-26 to 2025-11-25) and the stateless 2026-07-28
+revision (`server/discover`) are both answered. `--searx`, `--allow-private` and `--user-agent` apply to
+every call.
+
+Set it up (with the binary at `~/.local/bin/webfetch`):
+
+- **Claude Code**: `claude mcp add --transport stdio --scope user webfetch -- ~/.local/bin/webfetch --mcp`.
+  For Code Mode, set `"env": {"CLAUDE_CODE_EXPERIMENTAL_CODE_MODE": "1"}` in `~/.claude/settings.json`
+  (v2.1.323 or later, interactive terminal sessions).
+- **pi**: in `~/.pi/agent/mcp.json`, `"webfetch": {"command": "/home/<you>/.local/bin/webfetch", "args": ["--mcp"], "exposure": "codemode"}`;
+  pi turns `codemode` on when the server connects.
+- **Hermes**: under `mcp_servers` in `~/.hermes/config.yaml`, `webfetch: {command: ..., args: [--mcp], enabled: true}`;
+  check with `hermes mcp test webfetch`.
+
 ## User agent
 
 webfetch says who it is (`webfetch/<version> (+https://github.com/Joseph-Sailor-Usher/webfetch)`), as
