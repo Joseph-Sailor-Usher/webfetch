@@ -292,21 +292,47 @@ pub fn client_proxied(
     b.build().expect("failed to build HTTP client")
 }
 
+/// The most bytes of a response body webfetch reads by default (`--max-bytes`): reading stops there, so
+/// a huge or endless reply cannot fill memory.
+pub const MAX_BYTES: usize = 10_000_000;
+
 /// A fetched page: the URL it ended at (after redirects) and its body.
 #[derive(Debug)]
 pub struct Page {
     pub url: String,
     pub body: String,
+    /// true when the body went on past the cap and was cut there
+    pub truncated: bool,
+    /// the cap the body was read under, in bytes
+    pub max_bytes: usize,
+}
+
+impl Page {
+    /// What to say about a cut-off body (None when the whole body was read).
+    pub fn truncation_notice(&self) -> Option<String> {
+        self.truncated.then(|| {
+            format!("truncated: the body was cut at {} bytes (--max-bytes); the page goes on past what is shown", self.max_bytes)
+        })
+    }
 }
 
 /// GET `url`. A status outside 2xx is an error, not a page. With `guard`, a private literal IP is
-/// refused before anything is sent (names are refused by the guarding client's resolver).
+/// refused before anything is sent (names are refused by the guarding client's resolver). At most
+/// [`MAX_BYTES`] of the body are read.
 pub fn fetch(client: &reqwest::blocking::Client, url: &str, guard: bool) -> Result<Page> {
     fetch_with(client, url, guard.then(Guard::from_interfaces).as_ref())
 }
 
 /// GET `url`, its literal IP checked first by `guard` when there is one (as [`fetch`] does).
 pub fn fetch_with(client: &reqwest::blocking::Client, url: &str, guard: Option<&Guard>) -> Result<Page> {
+    fetch_capped(client, url, guard, MAX_BYTES)
+}
+
+/// GET `url` as [`fetch_with`] does, reading at most `max_bytes` of the body: a Content-Length over the
+/// cap is refused before the body is read, and a body that goes on past the cap is cut there (the page
+/// is marked `truncated`). The body is decoded as UTF-8, lossily, and a cut never splits a character.
+pub fn fetch_capped(client: &reqwest::blocking::Client, url: &str, guard: Option<&Guard>, max_bytes: usize) -> Result<Page> {
+    use std::io::Read;
     let parsed = reqwest::Url::parse(url).map_err(|e| Error(format!("not a URL: {url} ({e})")))?;
     if let Some(g) = guard {
         g.check_url(&parsed)?;
@@ -317,8 +343,41 @@ pub fn fetch_with(client: &reqwest::blocking::Client, url: &str, guard: Option<&
     if !status.is_success() {
         return Err(Error(format!("HTTP {status} from {final_url}")));
     }
-    let body = resp.text().map_err(|e| Error(format!("error reading {final_url}: {}", chain(&e))))?;
-    Ok(Page { url: final_url, body })
+    if let Some(len) = resp.content_length() {
+        if len > max_bytes as u64 {
+            return Err(Error(format!(
+                "refusing {final_url}: its body is {len} bytes, over the {max_bytes}-byte cap (--max-bytes)"
+            )));
+        }
+    }
+    let mut buf = Vec::new();
+    resp.take(max_bytes as u64 + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| Error(format!("error reading {final_url}: {}", chain(&e))))?;
+    let truncated = buf.len() > max_bytes;
+    if truncated {
+        buf.truncate(utf8_cut(&buf, max_bytes));
+    }
+    let body = String::from_utf8_lossy(&buf).into_owned();
+    Ok(Page { url: final_url, body, truncated, max_bytes })
+}
+
+/// Where to cut `bytes` at no more than `limit`, backed off so a UTF-8 character is not split.
+pub fn utf8_cut(bytes: &[u8], limit: usize) -> usize {
+    let end = limit.min(bytes.len());
+    if end == bytes.len() {
+        return end;
+    }
+    // bytes[end] is the first byte left out; if it continues a character, back up to that character's start
+    let mut cut = end;
+    while cut > 0 && end - cut < 3 && (bytes[cut] & 0xC0) == 0x80 {
+        cut -= 1;
+    }
+    if (bytes[cut] & 0xC0) == 0x80 {
+        end // not valid UTF-8 here anyway: the lossy decode marks it
+    } else {
+        cut
+    }
 }
 
 /// An error and its causes in one line (reqwest puts the useful part, like the guard's refusal, in a source).

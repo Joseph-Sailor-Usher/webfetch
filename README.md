@@ -146,12 +146,15 @@ Wikimedia and others ask of scripts. `--user-agent` sends another, for a site th
 ## Exit status
 
 - `0`: the page or the results were printed
-- `1`: the fetch failed (network error, an HTTP status outside 2xx, a refused private address, a search
-  with no results); the reason is on stderr
+- `1`: the fetch failed (network error, an HTTP status outside 2xx, a refused private address, a body
+  whose Content-Length is over `--max-bytes`, a search with no results); the reason is on stderr
 - `2`: the command line was wrong (for example neither a URL nor `--search`)
 
 ## Limits
 
+- At most 10 MB of a response body is read (`--max-bytes` sets another cap). A body that goes on past the
+  cap is cut there, at a character boundary, and the output and stderr say so; a `Content-Length` over
+  the cap is refused (exit status 1) before the body is read. The MCP server reads under the default cap.
 - No JavaScript: a page that builds its content in the browser comes back nearly empty. Use a headless
   browser (Playwright) for those.
 - Readability is a heuristic: on pages that are not articles (home pages, listings) it can pick the

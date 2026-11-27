@@ -225,7 +225,61 @@ fn http_errors_are_errors() {
     let c = client(false, USER_AGENT);
     let err = fetch(&c, &format!("http://127.0.0.1:{port}/missing"), false).unwrap_err();
     assert!(err.0.contains("404"), "{err}");
-    assert_eq!(fetch(&c, &format!("http://127.0.0.1:{port}/ok"), false).unwrap().body, "ok");
+    let ok = fetch(&c, &format!("http://127.0.0.1:{port}/ok"), false).unwrap();
+    assert_eq!(ok.body, "ok");
+    assert!(!ok.truncated && ok.truncation_notice().is_none());
+}
+
+#[test]
+fn caps_the_body_it_reads() {
+    use std::io::{Read, Write};
+    use std::time::{Duration, Instant};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (sent_tx, sent_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for (i, stream) in listener.incoming().take(2).enumerate() {
+            let mut s = stream.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = s.read(&mut buf);
+            if i == 0 {
+                // an endless body of two-byte characters, no Content-Length: it ends only when the reader hangs up
+                s.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n").unwrap();
+                let chunk = "é".repeat(8192);
+                let mut sent = 0usize;
+                while s.write_all(chunk.as_bytes()).is_ok() {
+                    sent += chunk.len();
+                }
+                sent_tx.send(sent).unwrap();
+            } else {
+                // a Content-Length of a gigabyte, and no body at all: reading it would hang until the timeout
+                s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000000000\r\n\r\n").unwrap();
+                let _ = s.read(&mut buf); // hold the connection open until the client hangs up
+            }
+        }
+    });
+    let c = client(false, USER_AGENT);
+    let cap = 100_001; // odd, so the cap lands inside a character
+
+    let start = Instant::now();
+    let page = fetch_capped(&c, &format!("http://127.0.0.1:{port}/endless"), None, cap).unwrap();
+    assert!(start.elapsed() < Duration::from_secs(10), "reading went on: {:?}", start.elapsed());
+    assert!(page.truncated);
+    assert_eq!(page.body.len(), 100_000, "cut back to a character boundary under the cap");
+    assert!(page.body.chars().all(|ch| ch == 'é'), "no character split or replaced");
+    assert!(page.truncation_notice().unwrap().contains("100001 bytes"));
+    drop(page);
+    // the server stops once the reader hangs up: what it wrote is the cap plus what the sockets buffer, not endless
+    let sent = sent_rx.recv_timeout(Duration::from_secs(10)).expect("the server was still writing");
+    assert!(sent < 64 << 20, "the server wrote {sent} bytes");
+
+    let start = Instant::now();
+    let err = fetch_capped(&c, &format!("http://127.0.0.1:{port}/huge"), None, cap).unwrap_err();
+    assert!(start.elapsed() < Duration::from_secs(5), "the body was waited for: {:?}", start.elapsed());
+    assert!(err.0.contains("1000000000 bytes, over the 100001-byte cap"), "{err}");
+
+    // the cut backs off to the start of a character it would split, and never past the body's end
+    assert!(utf8_cut("aé".as_bytes(), 2) == 1 && utf8_cut(b"abc", 5) == 3);
 }
 
 #[test]

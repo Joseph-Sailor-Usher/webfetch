@@ -1,5 +1,5 @@
 use clap::{ArgGroup, Parser};
-use webfetch::{client, content, fetch, format_hits, label, search, truncate_chars, Format, RAW_LIMIT};
+use webfetch::{client, content, fetch_capped, format_hits, label, search, truncate_chars, Format, RAW_LIMIT};
 
 #[derive(Parser)]
 #[command(name = "webfetch", version)]
@@ -15,7 +15,7 @@ struct Cli {
 
     /// Run as an MCP server on stdio (tools: fetch_page, search); --searx, --allow-private,
     /// --user-agent, --allow-url, --allow-domain and --max-fetches apply to every call
-    #[arg(long, conflicts_with_all = ["text", "full", "raw", "no_label", "lines"])]
+    #[arg(long, conflicts_with_all = ["text", "full", "raw", "no_label", "lines", "max_bytes"])]
     mcp: bool,
 
     /// SearXNG base URL for --search
@@ -57,6 +57,10 @@ struct Cli {
     /// With --mcp: most fetch_page calls one session may make [default: 50]
     #[arg(long, value_name = "N")]
     max_fetches: Option<u32>,
+    /// The most bytes of the response body to read; a longer body is cut there, and a
+    /// Content-Length over it is refused
+    #[arg(long, default_value_t = webfetch::MAX_BYTES)]
+    max_bytes: usize,
 
     /// User agent to send (default: webfetch's own name and version)
     #[arg(long, default_value = webfetch::USER_AGENT)]
@@ -103,10 +107,18 @@ fn run(cli: &Cli) -> webfetch::Result<()> {
     } else {
         let url = cli.url.as_deref().expect("clap requires a URL or --search");
         let guard = !cli.allow_private;
-        let page = fetch(&client(guard, &cli.user_agent), url, guard)?;
+        let checker = guard.then(webfetch::Guard::from_interfaces);
+        let page = fetch_capped(&client(guard, &cli.user_agent), url, checker.as_ref(), cli.max_bytes)?;
+        let cut = page.truncation_notice();
+        if let Some(n) = &cut {
+            eprintln!("webfetch: {n}");
+        }
         if cli.raw {
             if !cli.no_label {
                 println!("{}", label(&page.url));
+            }
+            if let Some(n) = &cut {
+                println!("[{n}]");
             }
             println!("{}", truncate_chars(&page.body, RAW_LIMIT));
             return Ok(());
@@ -119,6 +131,9 @@ fn run(cli: &Cli) -> webfetch::Result<()> {
         header.push(format!("Source: {}", page.url));
         if let Some(by) = &c.byline {
             header.push(format!("By: {by}"));
+        }
+        if let Some(n) = &cut {
+            header.push(format!("[{n}]"));
         }
         if !c.article && !cli.full {
             eprintln!("webfetch: no main content found; printing the whole page");
