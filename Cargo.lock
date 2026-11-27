@@ -2004,8 +2004,10 @@ name = "webfetch"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "ego-tree",
  "reqwest",
  "scraper",
+ "serde_json",
  "urlencoding",
 ]
 
